@@ -2,11 +2,24 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "./router.js";
 
 const LEGACY_MEMO_ID = "memo-legacy";
-const priorityRank = { 높음: 0, 중간: 1, 낮음: 2 };
 const sourceLabels = {
   mentioned: "사용자 언급 물품",
   suggested: "AI 추가 추천 물품",
   manual: "직접 추가",
+};
+const userIntentLabels = {
+  buy_new: "새로 구매하기",
+  check_existing: "집에 있는 물품 상태 확인",
+  consider: "후보를 비교해 보기",
+  prepare: "필요 여부를 확인하고 준비",
+  unknown: "메모 내용을 확인해 주세요",
+};
+const recommendedActionTypeLabels = {
+  buy: "구매 후보 보기",
+  check: "기존 물품 상태 확인",
+  compare: "후보 비교",
+  prepare_later: "구매 또는 준비",
+  date_needed: "필요 날짜 입력",
 };
 
 function uid(prefix = "item") {
@@ -22,11 +35,11 @@ function readStored(key, fallback) {
   }
 }
 
-function useStoredState(key, initialValue) {
+function useStoredState(key, initialValue, transform = (saved) => saved) {
   const [value, setValue] = useState(() => {
     const fallback =
       typeof initialValue === "function" ? initialValue() : initialValue;
-    return readStored(key, fallback);
+    return transform(readStored(key, fallback));
   });
 
   useEffect(() => {
@@ -115,19 +128,263 @@ function normalize(value) {
     .toLowerCase();
 }
 
+function eventNamesReferToSameEvent(left, right) {
+  const normalizedLeft = normalize(left).replace(/[^\p{L}\p{N}]/gu, "");
+  const normalizedRight = normalize(right).replace(/[^\p{L}\p{N}]/gu, "");
+  if (!normalizedLeft || !normalizedRight) return false;
+  return (
+    normalizedLeft === normalizedRight ||
+    normalizedLeft.includes(normalizedRight) ||
+    normalizedRight.includes(normalizedLeft)
+  );
+}
+
+function getAmbiguousDateText(value) {
+  return (
+    String(value || "").match(
+      /(?:다음|이번|저번)?\s*(?:달|월)\s*(?:초|중순|말)|날짜\s*(?:미정|확인\s*필요)|언젠가|무렵|쯤|(?:일정|소풍|생신)\s*전\b/i,
+    )?.[0] || ""
+  );
+}
+
+function sanitizeEventMeta(eventMeta = {}, fallbackEventName = "기타 구매") {
+  const eventName = eventMeta.eventName || fallbackEventName;
+  const ambiguousDateText = getAmbiguousDateText(
+    `${eventName} ${eventMeta.eventDateText || ""}`,
+  );
+  if (!ambiguousDateText) return { ...eventMeta, eventName };
+
+  return {
+    ...eventMeta,
+    eventName,
+    eventDateText: `${ambiguousDateText} · 날짜 확인 필요`,
+    eventDate: null,
+    eventDateConfidence: "low",
+  };
+}
+
+async function parseApiResponse(response, fallbackMessage) {
+  const text = await response.text();
+  if (!text.trim()) {
+    throw new Error(
+      `${fallbackMessage} 서버 응답이 비어 있습니다. 잠시 후 다시 시도해 주세요.`,
+    );
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(
+      `${fallbackMessage} 서버 응답 형식을 읽지 못했습니다. 잠시 후 다시 시도해 주세요.`,
+    );
+  }
+}
+
+function normalizeAnalysisItem(item, event, sourceType) {
+  const {
+    priority: _priority,
+    purchaseDeadline: _purchaseDeadline,
+    purchaseDeadlineText: _purchaseDeadlineText,
+    deadlineReason: _deadlineReason,
+    suggestedActionStartDate: _suggestedActionStartDate,
+    suggestedActionEndDate: _suggestedActionEndDate,
+    suggestedActionDate: _suggestedActionDate,
+    suggestedActionTimingText: _suggestedActionTimingText,
+    timingReason: _timingReason,
+    ...currentItem
+  } = item;
+  const name = item.name || item.itemName || "";
+  const eventName =
+    item.eventName || item.relatedEvent || event.eventName || "기타 구매";
+  const inheritsEventDate = eventNamesReferToSameEvent(
+    eventName,
+    event.eventName,
+  );
+  const neededDate =
+    item.neededDate || (inheritsEventDate ? event.eventDate : null) || null;
+  const neededDateText =
+    item.neededDateText ||
+    (inheritsEventDate ? event.eventDateText : null) ||
+    "날짜 확인 필요";
+  const recommendedActionDate =
+    item.recommendedActionDate ||
+    item.suggestedActionStartDate ||
+    item.suggestedActionDate ||
+    item.purchaseDeadline ||
+    null;
+  const recommendedActionEndDate =
+    item.recommendedActionEndDate ||
+    item.suggestedActionEndDate ||
+    item.suggestedActionDate ||
+    item.purchaseDeadline ||
+    null;
+  const recommendedActionTimingText =
+    item.recommendedActionTimingText ||
+    item.suggestedActionTimingText ||
+    item.purchaseDeadlineText ||
+    "";
+
+  return {
+    ...currentItem,
+    name,
+    itemName: name,
+    eventName,
+    relatedEvent: eventName,
+    analysisSourceType: item.analysisSourceType || item.sourceType,
+    sourceType,
+    userIntent: item.userIntent || "unknown",
+    userIntentText:
+      item.userIntentText ||
+      userIntentLabels[item.userIntent] ||
+      item.reason ||
+      "",
+    neededDate,
+    neededDateText,
+    dateConfidence:
+      item.dateConfidence ||
+      event.eventDateConfidence ||
+      (neededDate ? "medium" : "low"),
+    timingConfidence: item.timingConfidence || "low",
+    recommendedActionDate,
+    recommendedActionEndDate,
+    recommendedActionTimingText,
+    recommendedActionType:
+      item.recommendedActionType || inferRecommendedActionType(item),
+    actionReason: item.actionReason || item.timingReason || item.reason || "",
+  };
+}
+
+function inferRecommendedActionType(item = {}) {
+  if (item.userIntent === "check_existing") return "check";
+  if (item.userIntent === "consider") return "compare";
+  return item.neededDate ? "buy" : "date_needed";
+}
+
+function migrateAnalyses(analyses = {}) {
+  return Object.fromEntries(
+    Object.entries(analyses).map(([memoId, analysis]) => [
+      memoId,
+      {
+        ...analysis,
+        items: (analysis.items || []).map((item) =>
+          normalizeAnalysisItem(
+            item,
+            {
+              eventName: item.eventName,
+              eventDate: item.neededDate,
+              eventDateText: item.neededDateText,
+              eventDateConfidence: item.dateConfidence,
+            },
+            item.sourceType || "mentioned",
+          ),
+        ),
+      },
+    ]),
+  );
+}
+
+function migrateShoppingList(items = []) {
+  return items.map((item) =>
+    normalizeAnalysisItem(
+      item,
+      {
+        eventName: item.eventName,
+        eventDate: item.neededDate,
+        eventDateText: item.neededDateText,
+        eventDateConfidence: item.dateConfidence,
+      },
+      item.sourceType || "manual",
+    ),
+  );
+}
+
+function createEventMeta(event) {
+  return sanitizeEventMeta({
+    eventName: event.eventName || "기타 구매",
+    eventDateText: event.eventDateText || "날짜 확인 필요",
+    eventDate: event.eventDate || null,
+    eventDateConfidence:
+      event.eventDateConfidence || (event.eventDate ? "medium" : "low"),
+  });
+}
+
+function getEventMeta(analysis, eventName, items = []) {
+  const saved = analysis.eventMetaByName?.[eventName];
+  if (saved) return sanitizeEventMeta(saved, eventName);
+  const relatedSaved = Object.values(analysis.eventMetaByName || {}).find(
+    (eventMeta) =>
+      eventNamesReferToSameEvent(eventMeta.eventName, eventName),
+  );
+  if (relatedSaved) return sanitizeEventMeta(relatedSaved, eventName);
+  if (analysis.eventMetaByName) {
+    return {
+      eventName,
+      eventDateText: "날짜 확인 필요",
+      eventDate: null,
+      eventDateConfidence: "low",
+    };
+  }
+
+  const firstItem = items[0] || {};
+  return sanitizeEventMeta({
+    eventName,
+    eventDateText: firstItem.neededDateText || "날짜 확인 필요",
+    eventDate: firstItem.neededDate || null,
+    eventDateConfidence:
+      firstItem.dateConfidence || (firstItem.neededDate ? "medium" : "low"),
+  });
+}
+
+function formatEventDate(eventMeta) {
+  if (!eventMeta.eventDate)
+    return eventMeta.eventDateText || "날짜 확인 필요";
+  return eventMeta.eventDateText
+    ? `${formatDate(eventMeta.eventDate)} · ${eventMeta.eventDateText}`
+    : formatDate(eventMeta.eventDate);
+}
+
+function formatNeededDate(item) {
+  if (!item.neededDate) return item.neededDateText || "날짜 확인 필요";
+  const context = item.neededDateText;
+  return context
+    ? `${formatDate(item.neededDate)} · ${context}`
+    : formatDate(item.neededDate);
+}
+
+function getRecommendedActionTiming(item) {
+  return (
+    item.recommendedActionTimingText ||
+    (item.recommendedActionDate
+      ? `${formatDate(item.recommendedActionDate)}까지 액션 진행`
+      : "날짜 입력 필요")
+  );
+}
+
+function makeEditableActionTiming(item) {
+  const action =
+    recommendedActionTypeLabels[item.recommendedActionType] || "액션 진행";
+  if (
+    item.recommendedActionDate &&
+    item.recommendedActionEndDate &&
+    item.recommendedActionDate !== item.recommendedActionEndDate
+  ) {
+    return `${formatDate(item.recommendedActionDate)}~${formatDate(
+      item.recommendedActionEndDate,
+    )} 중 ${action}`;
+  }
+  const date = item.recommendedActionDate || item.recommendedActionEndDate;
+  return date ? `${formatDate(date)}까지 ${action}` : "날짜 입력 필요";
+}
+
 function flattenEvents(events = []) {
   return events.flatMap((event) => {
     const mentioned = (event.mentionedItems || []).map((item) => ({
-      ...item,
+      ...normalizeAnalysisItem(item, event, "mentioned"),
       id: uid("mention"),
-      eventName: item.eventName || event.eventName || "기타 구매",
-      sourceType: "mentioned",
     }));
     const suggested = (event.suggestedItems || []).map((item) => ({
-      ...item,
+      ...normalizeAnalysisItem(item, event, "suggested"),
       id: uid("suggestion"),
-      eventName: item.eventName || event.eventName || "기타 구매",
-      sourceType: "suggested",
     }));
     return [...mentioned, ...suggested];
   });
@@ -143,9 +400,37 @@ function Field({ label, children, wide = false }) {
 }
 
 function ItemEditor({ item, onSave, onCancel }) {
-  const [draft, setDraft] = useState(item);
+  const [draft, setDraft] = useState(() =>
+    normalizeAnalysisItem(
+      item,
+      {
+        eventName: item.eventName,
+        eventDate: item.neededDate,
+        eventDateText: item.neededDateText,
+        eventDateConfidence: item.dateConfidence,
+      },
+      item.sourceType || "manual",
+    ),
+  );
   const update = (key, value) =>
     setDraft((current) => ({ ...current, [key]: value }));
+  const updateNeededDate = (value) =>
+    setDraft((current) => ({
+      ...current,
+      neededDate: value || null,
+      neededDateText: value
+        ? `${formatDate(value)} (직접 입력)`
+        : "날짜 확인 필요",
+      dateConfidence: value ? "high" : "low",
+    }));
+  const updateRecommendedActionDate = (key, value) =>
+    setDraft((current) => {
+      const next = { ...current, [key]: value || null };
+      return {
+        ...next,
+        recommendedActionTimingText: makeEditableActionTiming(next),
+      };
+    });
 
   return (
     <div className="editor">
@@ -166,28 +451,47 @@ function ItemEditor({ item, onSave, onCancel }) {
           <input
             type="date"
             value={toInputDate(draft.neededDate)}
-            onChange={(event) =>
-              update("neededDate", event.target.value || null)
-            }
+            onChange={(event) => updateNeededDate(event.target.value)}
           />
         </Field>
-        <Field label="구매 마감일">
+        <Field label="액션 시작 날짜">
           <input
             type="date"
-            value={toInputDate(draft.purchaseDeadline)}
+            value={toInputDate(draft.recommendedActionDate)}
             onChange={(event) =>
-              update("purchaseDeadline", event.target.value || null)
+              updateRecommendedActionDate(
+                "recommendedActionDate",
+                event.target.value,
+              )
             }
           />
         </Field>
-        <Field label="우선순위">
+        <Field label="액션 종료 날짜">
+          <input
+            type="date"
+            value={toInputDate(draft.recommendedActionEndDate)}
+            onChange={(event) =>
+              updateRecommendedActionDate(
+                "recommendedActionEndDate",
+                event.target.value,
+              )
+            }
+          />
+        </Field>
+        <Field label="액션 종류">
           <select
-            value={draft.priority || "중간"}
-            onChange={(event) => update("priority", event.target.value)}
+            value={draft.recommendedActionType || "date_needed"}
+            onChange={(event) =>
+              update("recommendedActionType", event.target.value)
+            }
           >
-            <option>높음</option>
-            <option>중간</option>
-            <option>낮음</option>
+            {Object.entries(recommendedActionTypeLabels).map(
+              ([value, label]) => (
+                <option value={value} key={value}>
+                  {label}
+                </option>
+              ),
+            )}
           </select>
         </Field>
         <Field label="비고" wide>
@@ -195,6 +499,22 @@ function ItemEditor({ item, onSave, onCancel }) {
             value={draft.note || ""}
             onChange={(event) => update("note", event.target.value)}
             placeholder="선호, 사이즈, 확인할 점"
+          />
+        </Field>
+        <Field label="AI 권장 액션 시점" wide>
+          <input
+            value={draft.recommendedActionTimingText || ""}
+            onChange={(event) =>
+              update("recommendedActionTimingText", event.target.value)
+            }
+            placeholder="예: 6월 1일~3일 중 구매 후보 보기"
+          />
+        </Field>
+        <Field label="권장 이유" wide>
+          <input
+            value={draft.actionReason || ""}
+            onChange={(event) => update("actionReason", event.target.value)}
+            placeholder="예: 배송 후 세척과 사용 확인 시간이 필요할 수 있음"
           />
         </Field>
       </div>
@@ -237,6 +557,7 @@ function MemoCard({
   onOpenDetail,
   onAnalyze,
   onOpenAnalysis,
+  onDelete,
 }) {
   const addedCount = addedItems.length;
 
@@ -321,95 +642,134 @@ function MemoCard({
               {isLoading ? "AI가 분석하고 있어요..." : "AI로 분석하기"}
             </button>
           )}
+          <button
+            className="text-button danger memo-delete-button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onDelete();
+            }}
+            disabled={isLoading}
+          >
+            삭제
+          </button>
         </div>
       </div>
     </article>
   );
 }
 
-function AnalysisItemCard({
-  item,
-  existingItem,
-  onAdd,
-  onViewExisting,
-  onDelete,
-  onUpdate,
-}) {
+function AnalysisItemCard({ item, existingItem, onAdd, onDelete, onUpdate }) {
   const [editing, setEditing] = useState(false);
 
-  if (editing) {
-    return (
-      <ItemEditor
-        item={item}
-        onSave={(updated) => {
-          onUpdate(updated);
-          setEditing(false);
-        }}
-        onCancel={() => setEditing(false)}
-      />
-    );
-  }
-
   return (
-    <article className={`suggestion-card source-${item.sourceType}`}>
-      <div className="card-heading">
-        <div>
-          <Badge tone={item.sourceType === "suggested" ? "sage" : "apricot"}>
-            {sourceLabels[item.sourceType]}
-          </Badge>
-          <h4>{item.name}</h4>
+    <>
+      <article
+        className={`suggestion-card source-${item.sourceType} ${
+          existingItem ? "is-added" : ""
+        }`}
+      >
+        <div className="card-heading">
+          <div>
+            <Badge tone={item.sourceType === "suggested" ? "sage" : "apricot"}>
+              {sourceLabels[item.sourceType]}
+            </Badge>
+            <h4>{item.name}</h4>
+          </div>
         </div>
-        <Badge tone={item.priority === "높음" ? "red" : "neutral"}>
-          {item.priority || "중간"}
-        </Badge>
-      </div>
-      <p className="reason">{item.reason || "필요 여부를 확인해 주세요."}</p>
-      <dl className="mini-details">
-        <div>
-          <dt>관련 일정</dt>
-          <dd>{item.eventName || "-"}</dd>
-        </div>
-        <div>
-          <dt>필요 날짜</dt>
-          <dd>{item.neededDateText || formatDate(item.neededDate)}</dd>
-        </div>
-        <div>
-          <dt>구매 마감</dt>
-          <dd>
-            {item.purchaseDeadlineText || formatDate(item.purchaseDeadline)}
-          </dd>
-        </div>
-        <div>
-          <dt>비고</dt>
-          <dd>{item.note || "-"}</dd>
-        </div>
-      </dl>
-      <div className="card-actions">
-        {existingItem ? (
-          <>
+        <dl className="mini-details analysis-details">
+          {item.sourceType !== "suggested" && (
+            <div>
+              <dt>사용자 메모 의미</dt>
+              <dd>
+                {item.userIntentText ||
+                  userIntentLabels[item.userIntent] ||
+                  item.reason ||
+                  "필요 여부를 확인해 주세요."}
+              </dd>
+            </div>
+          )}
+          <div>
+            <dt>필요 날짜</dt>
+            <dd>{formatNeededDate(item)}</dd>
+          </div>
+          <div>
+            <dt>AI 권장 액션 시점</dt>
+            <dd>{getRecommendedActionTiming(item)}</dd>
+          </div>
+          <div>
+            <dt>권장 이유</dt>
+            <dd>{item.actionReason || item.reason || "확인 필요"}</dd>
+          </div>
+          <div>
+            <dt>비고</dt>
+            <dd>{item.note || "-"}</dd>
+          </div>
+        </dl>
+        <div className="card-actions analysis-card-actions">
+          {existingItem ? (
             <button className="button disabled small" disabled>
               이미 쇼핑 리스트에 있어요
             </button>
-            <button className="text-button" onClick={onViewExisting}>
-              기존 항목 보기
-            </button>
-          </>
-        ) : (
-          <button className="button primary small" onClick={() => onAdd(item)}>
-            쇼핑 리스트에 추가
-          </button>
-        )}
-        <button className="button ghost small" onClick={() => setEditing(true)}>
-          수정
-        </button>
-        <button
-          className="text-button danger"
-          onClick={() => onDelete(item.id)}
-        >
-          삭제
-        </button>
-      </div>
-    </article>
+          ) : (
+            <>
+              <div className="analysis-card-secondary-actions">
+                <button
+                  className="button ghost small"
+                  onClick={() => setEditing(true)}
+                >
+                  수정
+                </button>
+                <button
+                  className="text-button danger"
+                  onClick={() => onDelete(item.id)}
+                >
+                  삭제
+                </button>
+              </div>
+              <button
+                className="button primary small add-to-list-button"
+                onClick={() => onAdd(item)}
+              >
+                쇼핑 리스트에 추가
+              </button>
+            </>
+          )}
+        </div>
+      </article>
+      {editing && (
+        <div className="modal-backdrop" onMouseDown={() => setEditing(false)}>
+          <section
+            className="modal edit-modal"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="modal-heading">
+              <div>
+                <p className="section-kicker">AI ANALYSIS ITEM</p>
+                <h2>분석 물품 수정</h2>
+              </div>
+              <button
+                className="icon-button"
+                aria-label="닫기"
+                onClick={() => setEditing(false)}
+              >
+                ×
+              </button>
+            </div>
+            <p className="modal-intro">
+              일정에 맞춰 물품 정보와 권장 액션을 수정해 주세요.
+            </p>
+            <ItemEditor
+              item={item}
+              onSave={(updated) => {
+                onUpdate(updated);
+                setEditing(false);
+              }}
+              onCancel={() => setEditing(false)}
+            />
+          </section>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -420,7 +780,6 @@ function AnalysisSourceSection({
   items,
   shoppingList,
   onAdd,
-  onViewExisting,
   onDelete,
   onUpdate,
 }) {
@@ -448,7 +807,6 @@ function AnalysisSourceSection({
               existingItem={existingItem}
               key={item.id}
               onAdd={onAdd}
-              onViewExisting={() => onViewExisting(existingItem)}
               onDelete={onDelete}
               onUpdate={onUpdate}
             />
@@ -456,6 +814,36 @@ function AnalysisSourceSection({
         })}
       </div>
     </section>
+  );
+}
+
+function ShoppingListReceipt({ items }) {
+  return (
+    <aside className="shopping-receipt" aria-label="현재 쇼핑 리스트 물품">
+      <div className="receipt-heading">
+        <p>SHOPPING LIST</p>
+        <h3>담아둔 물품</h3>
+        <small>{items.length} ITEMS</small>
+      </div>
+      {items.length ? (
+        <ol className="receipt-items">
+          {items.map((item) => (
+            <li
+              className={item.status === "purchased" ? "is-completed" : ""}
+              key={item.id}
+            >
+              {item.name}
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="receipt-empty">아직 담긴 물품이 없어요.</p>
+      )}
+      <div className="receipt-total">
+        <span>TOTAL</span>
+        <b>{items.length}</b>
+      </div>
+    </aside>
   );
 }
 
@@ -503,7 +891,10 @@ function RecommendationModal({ item, onClose, onSelect }) {
       body: JSON.stringify({ item }),
     })
       .then(async (response) => {
-        const data = await response.json();
+        const data = await parseApiResponse(
+          response,
+          "상품 추천에 실패했습니다.",
+        );
         if (!response.ok)
           throw new Error(data.error || "상품 추천을 불러오지 못했습니다.");
         return data;
@@ -544,8 +935,8 @@ function RecommendationModal({ item, onClose, onSelect }) {
           </button>
         </div>
         <p className="modal-intro">
-          일정과 마감일을 고려해 수집된 상품 중에서 골랐어요. 배송 정보는 확인된
-          내용만 표시합니다.
+          일정과 AI 권장 액션 시점을 고려해 수집된 상품 중에서 골랐어요. 배송
+          정보는 확인된 내용만 표시합니다.
         </p>
         {state.demoMode && (
           <div className="notice">
@@ -601,6 +992,93 @@ function RecommendationModal({ item, onClose, onSelect }) {
   );
 }
 
+function ProductLinkModal({ item, onClose, onSave }) {
+  const [draft, setDraft] = useState({
+    productTitle: item.selectedProduct?.productTitle || "",
+    link: item.selectedProduct?.link || "",
+  });
+  const [error, setError] = useState("");
+
+  function save() {
+    const link = draft.link.trim();
+    if (!/^https?:\/\/\S+$/i.test(link)) {
+      setError("http:// 또는 https://로 시작하는 상품 링크를 입력해 주세요.");
+      return;
+    }
+    onSave({
+      productTitle: draft.productTitle.trim() || `${item.name} 직접 등록 상품`,
+      link,
+      price: "직접 확인",
+      deliveryInfo: "사용자 등록 링크",
+      reason: "사용자가 직접 찾은 상품 링크예요.",
+      caution: "상품 페이지에서 옵션, 가격, 배송 가능일을 확인해 주세요.",
+      source: "manual_link",
+    });
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <section
+        className="modal link-registration-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="link-registration-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="modal-heading">
+          <div>
+            <p className="section-kicker">PRODUCT LINK</p>
+            <h2 id="link-registration-title">상품 링크 등록</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="닫기">
+            ×
+          </button>
+        </div>
+        <p className="modal-intro">
+          직접 찾은 상품이 있다면 링크를 저장해 두세요. 실제 옵션과 배송
+          가능일은 상품 페이지에서 확인해 주세요.
+        </p>
+        <div className="editor-grid">
+          <Field label="상품명" wide>
+            <input
+              value={draft.productTitle}
+              onChange={(event) =>
+                setDraft((current) => ({
+                  ...current,
+                  productTitle: event.target.value,
+                }))
+              }
+              placeholder={`${item.name} 상품명 (선택)`}
+            />
+          </Field>
+          <Field label="상품 링크" wide>
+            <input
+              type="url"
+              value={draft.link}
+              onChange={(event) =>
+                setDraft((current) => ({
+                  ...current,
+                  link: event.target.value,
+                }))
+              }
+              placeholder="https://..."
+            />
+          </Field>
+        </div>
+        {error && <div className="error-box">{error}</div>}
+        <div className="editor-actions">
+          <button className="button primary small" onClick={save}>
+            링크 저장
+          </button>
+          <button className="button ghost small" onClick={onClose}>
+            취소
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function App() {
   const { route, navigate } = useRouter();
   const activeView = route.name;
@@ -609,10 +1087,12 @@ function App() {
   const [analysesByMemoId, setAnalysesByMemoId] = useStoredState(
     "salddeut.analysesByMemoId",
     createLegacyAnalyses,
+    migrateAnalyses,
   );
   const [shoppingList, setShoppingList] = useStoredState(
     "salddeut.shoppingList",
     createLegacyShoppingList,
+    migrateShoppingList,
   );
   const [newMemo, setNewMemo] = useState({ title: "", content: "" });
   const [analysisState, setAnalysisState] = useState({
@@ -624,7 +1104,8 @@ function App() {
   const [addedItemName, setAddedItemName] = useState(null);
   const [editingListItem, setEditingListItem] = useState(null);
   const [recommendationItem, setRecommendationItem] = useState(null);
-  const [sortBy, setSortBy] = useState("priority");
+  const [linkRegistrationItem, setLinkRegistrationItem] = useState(null);
+  const [sortBy, setSortBy] = useState("action");
 
   const memoById = useMemo(
     () => Object.fromEntries(memos.map((memo) => [memo.id, memo])),
@@ -647,13 +1128,15 @@ function App() {
 
   const sortedShoppingList = useMemo(() => {
     return [...shoppingList].sort((a, b) => {
-      if (a.status === "purchased" && b.status !== "purchased") return 1;
-      if (b.status === "purchased" && a.status !== "purchased") return -1;
-      if (sortBy === "deadline")
-        return compareDate(a.purchaseDeadline, b.purchaseDeadline);
+      if (sortBy === "action")
+        return compareDate(a.recommendedActionDate, b.recommendedActionDate);
       if (sortBy === "neededDate")
         return compareDate(a.neededDate, b.neededDate);
-      return (priorityRank[a.priority] ?? 1) - (priorityRank[b.priority] ?? 1);
+      if (sortBy === "recent")
+        return compareCreatedAtDescending(a.addedAt, b.addedAt);
+      if (a.status === "purchased" && b.status !== "purchased") return 1;
+      if (b.status === "purchased" && a.status !== "purchased") return -1;
+      return compareCreatedAtDescending(a.addedAt, b.addedAt);
     });
   }, [shoppingList, sortBy]);
 
@@ -710,7 +1193,10 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ memo: memo.content }),
       });
-      const data = await response.json();
+      const data = await parseApiResponse(
+        response,
+        "메모 분석에 실패했습니다.",
+      );
       if (!response.ok)
         throw new Error(data.error || "메모를 분석하지 못했습니다.");
 
@@ -721,6 +1207,12 @@ function App() {
             data.events.map((event) => event.eventName || "기타 구매"),
           ),
         ],
+        eventMetaByName: Object.fromEntries(
+          data.events.map((event) => [
+            event.eventName || "기타 구매",
+            createEventMeta(event),
+          ]),
+        ),
         items: flattenEvents(data.events),
         analyzedAt: new Date().toISOString(),
         demoMode: Boolean(data.demoMode),
@@ -750,13 +1242,86 @@ function App() {
     }));
   }
 
+  function updateAnalysisEventDate(eventName, value) {
+    if (!selectedMemoId) return;
+    const eventDate = value || null;
+    const eventDateText = value
+      ? `${formatDate(value)} (직접 입력)`
+      : "날짜 확인 필요";
+    const eventDateConfidence = value ? "high" : "low";
+
+    setAnalysesByMemoId((current) => {
+      const analysis = current[selectedMemoId];
+      const eventItems = (analysis?.items || []).filter(
+        (item) => item.eventName === eventName,
+      );
+      return {
+        ...current,
+        [selectedMemoId]: {
+          ...analysis,
+          eventMetaByName: {
+            ...(analysis.eventMetaByName || {}),
+            [eventName]: {
+              ...getEventMeta(analysis, eventName, eventItems),
+              eventDate,
+              eventDateText,
+              eventDateConfidence,
+            },
+          },
+          items: (analysis.items || []).map((item) =>
+            item.eventName === eventName
+              ? {
+                  ...item,
+                  neededDate: eventDate,
+                  neededDateText: eventDateText,
+                  dateConfidence: eventDateConfidence,
+                  recommendedActionTimingText:
+                    eventDate && !item.recommendedActionDate
+                      ? `${formatDate(
+                          eventDate,
+                        )} 기준 AI 권장 액션 시점 직접 수정 필요`
+                      : item.recommendedActionTimingText,
+                }
+              : item,
+          ),
+        },
+      };
+    });
+    setShoppingList((current) =>
+      current.map((item) =>
+        item.sourceMemoId === selectedMemoId && item.eventName === eventName
+          ? {
+              ...item,
+              neededDate: eventDate,
+              neededDateText: eventDateText,
+              dateConfidence: eventDateConfidence,
+              recommendedActionTimingText:
+                eventDate && !item.recommendedActionDate
+                  ? `${formatDate(
+                      eventDate,
+                    )} 기준 AI 권장 액션 시점 직접 수정 필요`
+                  : item.recommendedActionTimingText,
+            }
+          : item,
+      ),
+    );
+  }
+
   function addManualAnalysisItem(item) {
     if (!selectedMemoId) return;
     const manualItem = {
-      ...item,
+      ...normalizeAnalysisItem(
+        {
+          ...item,
+          userIntent: item.userIntent || "unknown",
+          userIntentText: item.userIntentText || "직접 추가한 준비 물품",
+          actionReason:
+            item.actionReason || "사용자가 분석 결과를 보고 직접 추가했어요.",
+        },
+        { eventName: item.eventName || "기타 구매" },
+        "manual",
+      ),
       id: uid("manual"),
-      eventName: item.eventName || "기타 구매",
-      sourceType: "manual",
       reason: item.reason || "직접 추가한 물품",
     };
     setAnalysesByMemoId((current) => {
@@ -783,6 +1348,11 @@ function App() {
         normalize(saved.eventName) === normalize(item.eventName),
     );
     if (duplicate) return;
+    const analysis = analysesByMemoId[selectedMemoId];
+    const eventItems = (analysis?.items || []).filter(
+      (analysisItem) => analysisItem.eventName === item.eventName,
+    );
+    const eventMeta = getEventMeta(analysis || {}, item.eventName, eventItems);
 
     setShoppingList((current) => [
       ...current,
@@ -794,6 +1364,10 @@ function App() {
         status: "pending",
         selectedProduct: null,
         purchasedAt: null,
+        addedAt: new Date().toISOString(),
+        neededDate: eventMeta.eventDate,
+        neededDateText: eventMeta.eventDateText,
+        dateConfidence: eventMeta.eventDateConfidence,
       },
     ]);
     setAddedItemName(item.name);
@@ -815,6 +1389,45 @@ function App() {
 
   function removeListItem(id) {
     setShoppingList((current) => current.filter((item) => item.id !== id));
+  }
+
+  function updateShoppingListNeededDate(id, value) {
+    const neededDate = value || null;
+    setShoppingList((current) =>
+      current.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              neededDate,
+              neededDateText: neededDate
+                ? `${formatDate(neededDate)} (직접 입력)`
+                : "날짜 확인 필요",
+              dateConfidence: neededDate ? "high" : "low",
+              recommendedActionTimingText:
+                neededDate && !item.recommendedActionDate
+                  ? `${formatDate(
+                      neededDate,
+                    )} 기준 AI 권장 액션 시점 직접 수정 필요`
+                  : item.recommendedActionTimingText,
+            }
+          : item,
+      ),
+    );
+  }
+
+  function removeMemo(memo) {
+    const shouldDelete = window.confirm(
+      `"${memo.title}" 메모를 삭제할까요?\n\n연결된 AI 분석 결과도 함께 삭제됩니다. 이미 쇼핑 리스트에 담은 물품은 유지됩니다.`,
+    );
+    if (!shouldDelete) return false;
+
+    setMemos((current) => current.filter((saved) => saved.id !== memo.id));
+    setAnalysesByMemoId((current) => {
+      const next = { ...current };
+      delete next[memo.id];
+      return next;
+    });
+    return true;
   }
 
   function togglePurchased(id) {
@@ -881,7 +1494,10 @@ function App() {
                 우리 가족의 생활용품과 관련된 메모를 적으면, 필요한 물건과 사야
                 할 때를 AI가 정리해드려요.
               </p>
-              <button className="button primary onboarding-cta" onClick={openInbox}>
+              <button
+                className="button primary onboarding-cta"
+                onClick={openInbox}
+              >
                 지금 시작하기 <span>→</span>
               </button>
             </div>
@@ -978,6 +1594,7 @@ function App() {
                     onOpenDetail={() => openMemoDetail(memo.id)}
                     onAnalyze={() => analyzeMemo(memo)}
                     onOpenAnalysis={() => openAnalysis(memo.id)}
+                    onDelete={() => removeMemo(memo)}
                   />
                 ))}
               </div>
@@ -1039,6 +1656,15 @@ function App() {
                       : "AI로 분석하기"}
                   </button>
                 )}
+                <button
+                  className="text-button danger memo-detail-delete-button"
+                  onClick={() => {
+                    if (removeMemo(selectedMemo)) openInbox();
+                  }}
+                  disabled={analysisState.loadingMemoId === selectedMemo.id}
+                >
+                  메모 삭제
+                </button>
               </div>
             </article>
             {analysisState.error && (
@@ -1076,7 +1702,9 @@ function App() {
                               item.status === "purchased" ? "sage" : "neutral"
                             }
                           >
-                            {item.status === "purchased" ? "구매 완료" : "구매 전"}
+                            {item.status === "purchased"
+                              ? "구매 완료"
+                              : "구매 전"}
                           </Badge>
                         </div>
                       ))}
@@ -1115,147 +1743,186 @@ function App() {
                 쇼핑 리스트 보기
               </button>
             </div>
-            <section className="analysis-summary">
-              <div>
-                <p className="section-kicker">AI ANALYSIS WORKSPACE</p>
-                <h2>{selectedMemo.title}</h2>
-                <p>{selectedMemo.content}</p>
-              </div>
-              <div className="analysis-meta">
-                <Badge tone="sage">분석 완료</Badge>
-                <small>{formatCreatedAt(selectedAnalysis.analyzedAt)}</small>
-              </div>
-            </section>
-            {selectedAnalysis.demoMode && (
-              <div className="notice">
-                OpenAI API 키가 없어 예시 분석을 보여 드리고 있어요. 키를
-                연결하면 작성한 메모를 AI가 직접 분석합니다.
-              </div>
-            )}
-            <div className="suggestion-groups">
-              {selectedAnalysisEventNames.map((eventName) => {
-                const eventItems = selectedAnalysis.items.filter(
-                  (item) => item.eventName === eventName,
-                );
-                return (
-                  <section className="event-group" key={eventName}>
-                    <button
-                      className="event-title"
-                      onClick={() => toggleEvent(eventName)}
-                      aria-expanded={!collapsedEvents[eventName]}
-                    >
-                      <span>일정</span>
-                      <h3>{eventName}</h3>
-                      <b>{eventItems.length}</b>
-                      <i
-                        className={`event-chevron ${
-                          collapsedEvents[eventName] ? "collapsed" : ""
-                        }`}
-                      >
-                        ⌃
-                      </i>
-                    </button>
-                    {!collapsedEvents[eventName] && (
-                      <div className="event-content">
-                        <AnalysisSourceSection
-                          title="사용자 언급 물품"
-                          description="메모에서 직접 찾은 물품이에요."
-                          tone="mentioned"
-                          items={eventItems.filter(
-                            (item) => item.sourceType === "mentioned",
-                          )}
-                          shoppingList={shoppingList}
-                          onAdd={addToShoppingList}
-                          onViewExisting={openShoppingList}
-                          onDelete={(id) =>
-                            updateAnalysisItems((items) =>
-                              items.filter((item) => item.id !== id),
-                            )
-                          }
-                          onUpdate={(updated) =>
-                            updateAnalysisItems((items) =>
-                              items.map((item) =>
-                                item.id === updated.id ? updated : item,
-                              ),
-                            )
-                          }
-                        />
-                        <AnalysisSourceSection
-                          title="AI 추가 추천 물품"
-                          description="일정 맥락을 바탕으로 함께 챙겨 본 물품이에요."
-                          tone="suggested"
-                          items={eventItems.filter(
-                            (item) => item.sourceType === "suggested",
-                          )}
-                          shoppingList={shoppingList}
-                          onAdd={addToShoppingList}
-                          onViewExisting={openShoppingList}
-                          onDelete={(id) =>
-                            updateAnalysisItems((items) =>
-                              items.filter((item) => item.id !== id),
-                            )
-                          }
-                          onUpdate={(updated) =>
-                            updateAnalysisItems((items) =>
-                              items.map((item) =>
-                                item.id === updated.id ? updated : item,
-                              ),
-                            )
-                          }
-                        />
-                        <AnalysisSourceSection
-                          title="직접 추가한 물품"
-                          description="분석 결과를 보고 직접 보완한 물품이에요."
-                          tone="manual"
-                          items={eventItems.filter(
-                            (item) => item.sourceType === "manual",
-                          )}
-                          shoppingList={shoppingList}
-                          onAdd={addToShoppingList}
-                          onViewExisting={openShoppingList}
-                          onDelete={(id) =>
-                            updateAnalysisItems((items) =>
-                              items.filter((item) => item.id !== id),
-                            )
-                          }
-                          onUpdate={(updated) =>
-                            updateAnalysisItems((items) =>
-                              items.map((item) =>
-                                item.id === updated.id ? updated : item,
-                              ),
-                            )
-                          }
-                        />
-                        {manualEventName === eventName ? (
-                          <ItemEditor
-                            item={{
-                              name: "",
-                              eventName,
-                              neededDate: null,
-                              purchaseDeadline: null,
-                              priority: "중간",
-                              note: "",
-                            }}
-                            onSave={addManualAnalysisItem}
-                            onCancel={() => setManualEventName(null)}
-                          />
-                        ) : (
-                          <button
-                            className="manual-add-card"
-                            onClick={() => setManualEventName(eventName)}
+            <div className="analysis-layout">
+              <div className="analysis-main">
+                <section className="analysis-summary">
+                  <div>
+                    <p className="section-kicker">AI ANALYSIS WORKSPACE</p>
+                    <h2>{selectedMemo.title}</h2>
+                    <p>{selectedMemo.content}</p>
+                  </div>
+                  <div className="analysis-meta">
+                    <Badge tone="sage">분석 완료</Badge>
+                    <small>
+                      {formatCreatedAt(selectedAnalysis.analyzedAt)}
+                    </small>
+                  </div>
+                </section>
+                {selectedAnalysis.demoMode && (
+                  <div className="notice">
+                    OpenAI API 키가 없어 예시 분석을 보여 드리고 있어요. 키를
+                    연결하면 작성한 메모를 AI가 직접 분석합니다.
+                  </div>
+                )}
+                <div className="suggestion-groups">
+                  {selectedAnalysisEventNames.map((eventName) => {
+                    const eventItems = selectedAnalysis.items.filter(
+                      (item) => item.eventName === eventName,
+                    );
+                    const eventMeta = getEventMeta(
+                      selectedAnalysis,
+                      eventName,
+                      eventItems,
+                    );
+                    const eventDateNeedsInput =
+                      !eventMeta.eventDate ||
+                      eventMeta.eventDateConfidence === "low";
+                    return (
+                      <section className="event-group" key={eventName}>
+                        <button
+                          className="event-title"
+                          onClick={() => toggleEvent(eventName)}
+                          aria-expanded={!collapsedEvents[eventName]}
+                        >
+                          <span>일정</span>
+                          <h3>{eventName}</h3>
+                          <b>{eventItems.length}</b>
+                          <i
+                            className={`event-chevron ${
+                              collapsedEvents[eventName] ? "collapsed" : ""
+                            }`}
                           >
-                            <span>+</span>
-                            <strong>직접 추가</strong>
-                            <small>
-                              이 일정에서 빠진 물품을 추가해 주세요.
-                            </small>
-                          </button>
+                            ⌃
+                          </i>
+                        </button>
+                        <div className="event-date-bar">
+                          <div>
+                            <span>공통 필요 날짜</span>
+                            <strong>{formatEventDate(eventMeta)}</strong>
+                          </div>
+                          {eventDateNeedsInput && (
+                            <label>
+                              <span>날짜 입력 필요</span>
+                              <input
+                                aria-label={`${eventName} 필요 날짜 입력`}
+                                type="date"
+                                value={toInputDate(eventMeta.eventDate)}
+                                onChange={(event) =>
+                                  updateAnalysisEventDate(
+                                    eventName,
+                                    event.target.value,
+                                  )
+                                }
+                              />
+                            </label>
+                          )}
+                        </div>
+                        {!collapsedEvents[eventName] && (
+                          <div className="event-content">
+                            <AnalysisSourceSection
+                              title="사용자 언급 물품"
+                              description="메모에서 직접 찾은 물품이에요."
+                              tone="mentioned"
+                              items={eventItems.filter(
+                                (item) => item.sourceType === "mentioned",
+                              )}
+                              shoppingList={shoppingList}
+                              onAdd={addToShoppingList}
+                              onDelete={(id) =>
+                                updateAnalysisItems((items) =>
+                                  items.filter((item) => item.id !== id),
+                                )
+                              }
+                              onUpdate={(updated) =>
+                                updateAnalysisItems((items) =>
+                                  items.map((item) =>
+                                    item.id === updated.id ? updated : item,
+                                  ),
+                                )
+                              }
+                            />
+                            <AnalysisSourceSection
+                              title="AI 추가 추천 물품"
+                              description="일정 맥락을 바탕으로 함께 챙겨 본 물품이에요."
+                              tone="suggested"
+                              items={eventItems.filter(
+                                (item) => item.sourceType === "suggested",
+                              )}
+                              shoppingList={shoppingList}
+                              onAdd={addToShoppingList}
+                              onDelete={(id) =>
+                                updateAnalysisItems((items) =>
+                                  items.filter((item) => item.id !== id),
+                                )
+                              }
+                              onUpdate={(updated) =>
+                                updateAnalysisItems((items) =>
+                                  items.map((item) =>
+                                    item.id === updated.id ? updated : item,
+                                  ),
+                                )
+                              }
+                            />
+                            <AnalysisSourceSection
+                              title="직접 추가한 물품"
+                              description="분석 결과를 보고 직접 보완한 물품이에요."
+                              tone="manual"
+                              items={eventItems.filter(
+                                (item) => item.sourceType === "manual",
+                              )}
+                              shoppingList={shoppingList}
+                              onAdd={addToShoppingList}
+                              onDelete={(id) =>
+                                updateAnalysisItems((items) =>
+                                  items.filter((item) => item.id !== id),
+                                )
+                              }
+                              onUpdate={(updated) =>
+                                updateAnalysisItems((items) =>
+                                  items.map((item) =>
+                                    item.id === updated.id ? updated : item,
+                                  ),
+                                )
+                              }
+                            />
+                            {manualEventName === eventName ? (
+                              <ItemEditor
+                                item={{
+                                  name: "",
+                                  eventName,
+                                  neededDate: eventMeta.eventDate,
+                                  neededDateText: eventMeta.eventDateText,
+                                  dateConfidence: eventMeta.eventDateConfidence,
+                                  recommendedActionDate: null,
+                                  recommendedActionEndDate: null,
+                                  recommendedActionTimingText: "",
+                                  recommendedActionType: "date_needed",
+                                  actionReason: "",
+                                  note: "",
+                                }}
+                                onSave={addManualAnalysisItem}
+                                onCancel={() => setManualEventName(null)}
+                              />
+                            ) : (
+                              <button
+                                className="manual-add-card"
+                                onClick={() => setManualEventName(eventName)}
+                              >
+                                <span>+</span>
+                                <strong>직접 추가</strong>
+                                <small>
+                                  이 일정에서 빠진 물품을 추가해 주세요.
+                                </small>
+                              </button>
+                            )}
+                          </div>
                         )}
-                      </div>
-                    )}
-                  </section>
-                );
-              })}
+                      </section>
+                    );
+                  })}
+                </div>
+              </div>
+              <ShoppingListReceipt items={shoppingList} />
             </div>
           </section>
         )}
@@ -1291,9 +1958,10 @@ function App() {
                   value={sortBy}
                   onChange={(event) => setSortBy(event.target.value)}
                 >
-                  <option value="priority">우선순위순</option>
-                  <option value="deadline">구매 마감일순</option>
+                  <option value="action">AI 권장 액션 시점순</option>
                   <option value="neededDate">필요 날짜순</option>
+                  <option value="recent">최근 추가순</option>
+                  <option value="status">구매 전/완료순</option>
                 </select>
               </label>
             </div>
@@ -1316,8 +1984,8 @@ function App() {
                       <th>관련 일정</th>
                       <th>출처 메모</th>
                       <th>필요 날짜</th>
-                      <th>구매 마감일</th>
-                      <th>우선순위</th>
+                      <th>AI 권장 액션 시점</th>
+                      <th>권장 이유</th>
                       <th>비고</th>
                       <th>구매할 상품</th>
                       <th>상태</th>
@@ -1338,17 +2006,47 @@ function App() {
                         </td>
                         <td>{item.eventName || "-"}</td>
                         <td className="source-memo-cell">
-                          {memoById[item.sourceMemoId]?.title || "이전 메모"}
+                          {memoById[item.sourceMemoId] ? (
+                            <button
+                              className="text-button source-memo-link"
+                              onClick={() => openMemoDetail(item.sourceMemoId)}
+                            >
+                              {memoById[item.sourceMemoId].title}
+                            </button>
+                          ) : (
+                            "이전 메모"
+                          )}
                         </td>
-                        <td>{formatDate(item.neededDate)}</td>
-                        <td>{formatDate(item.purchaseDeadline)}</td>
                         <td>
-                          <Badge
-                            tone={item.priority === "높음" ? "red" : "neutral"}
-                          >
-                            {item.priority || "중간"}
-                          </Badge>
+                          <span>{formatNeededDate(item)}</span>
+                          {(!item.neededDate ||
+                            item.dateConfidence === "low") && (
+                            <label className="table-date-input">
+                              <b>날짜 입력 필요</b>
+                              <input
+                                aria-label={`${item.name} 필요 날짜 입력`}
+                                type="date"
+                                value={toInputDate(item.neededDate)}
+                                onChange={(event) =>
+                                  updateShoppingListNeededDate(
+                                    item.id,
+                                    event.target.value,
+                                  )
+                                }
+                              />
+                            </label>
+                          )}
                         </td>
+                        <td>
+                          {getRecommendedActionTiming(item)}
+                          {!item.recommendedActionDate && (
+                            <small>
+                              필요 날짜를 입력하면 AI 권장 액션 시점을 더 정확히
+                              정리할 수 있어요.
+                            </small>
+                          )}
+                        </td>
+                        <td>{item.actionReason || item.reason || "-"}</td>
                         <td>{item.note || "-"}</td>
                         <td className="product-cell">
                           {item.selectedProduct ? (
@@ -1365,16 +2063,30 @@ function App() {
                                 className="text-button"
                                 onClick={() => setRecommendationItem(item)}
                               >
-                                변경
+                                AI로 다시 찾기
+                              </button>
+                              <button
+                                className="text-button"
+                                onClick={() => setLinkRegistrationItem(item)}
+                              >
+                                링크 변경
                               </button>
                             </>
                           ) : (
-                            <button
-                              className="button mini"
-                              onClick={() => setRecommendationItem(item)}
-                            >
-                              AI로 상품 찾기
-                            </button>
+                            <div className="product-actions">
+                              <button
+                                className="button ghost mini"
+                                onClick={() => setLinkRegistrationItem(item)}
+                              >
+                                상품 링크 등록
+                              </button>
+                              <button
+                                className="button mini"
+                                onClick={() => setRecommendationItem(item)}
+                              >
+                                AI로 상품 찾기
+                              </button>
+                            </div>
                           )}
                         </td>
                         <td>
@@ -1483,6 +2195,22 @@ function App() {
           }}
         />
       )}
+      {linkRegistrationItem && (
+        <ProductLinkModal
+          item={linkRegistrationItem}
+          onClose={() => setLinkRegistrationItem(null)}
+          onSave={(product) => {
+            setShoppingList((current) =>
+              current.map((item) =>
+                item.id === linkRegistrationItem.id
+                  ? { ...item, selectedProduct: product }
+                  : item,
+              ),
+            );
+            setLinkRegistrationItem(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1492,6 +2220,13 @@ function compareDate(left, right) {
   if (!left) return 1;
   if (!right) return -1;
   return new Date(`${left}T00:00:00`) - new Date(`${right}T00:00:00`);
+}
+
+function compareCreatedAtDescending(left, right) {
+  if (!left && !right) return 0;
+  if (!left) return 1;
+  if (!right) return -1;
+  return new Date(right) - new Date(left);
 }
 
 export default App;
