@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "./router.js";
 
 const LEGACY_MEMO_ID = "memo-legacy";
@@ -119,6 +119,13 @@ function formatCreatedAt(value) {
 
 function toInputDate(value) {
   return value || "";
+}
+
+function formatPrice(value) {
+  if (value === null || value === undefined || value === "") return "가격 확인 필요";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value);
+  return `${number.toLocaleString("ko-KR")}원`;
 }
 
 function normalize(value) {
@@ -876,53 +883,159 @@ function AddConfirmationModal({ itemName, onClose, onOpenShoppingList }) {
   );
 }
 
+function deliveryLabel(product) {
+  const value = product.deliveryInfo ?? product.deliveryText ?? null;
+  if (value) return value;
+  return "배송 정보는 상세 페이지에서 확인해 주세요.";
+}
+
+function ProductImage({ src, alt }) {
+  if (!src) return <div className="product-thumb is-empty" aria-hidden="true" />;
+  return (
+    <div className="product-thumb">
+      <img src={src} alt={alt} loading="lazy" />
+    </div>
+  );
+}
+
+function FollowUpForm({ questions, value, onChange, onSubmit, onCancel }) {
+  return (
+    <div className="follow-up">
+      {questions?.length > 0 && (
+        <ul className="follow-up-questions">
+          {questions.map((question, index) => (
+            <li key={index}>{question}</li>
+          ))}
+        </ul>
+      )}
+      <div className="editor-grid">
+        <Field label="예산">
+          <input
+            value={value.budget}
+            onChange={(event) => onChange("budget", event.target.value)}
+            placeholder="예: 2만 원 이하"
+          />
+        </Field>
+        <Field label="대상">
+          <input
+            value={value.recipient}
+            onChange={(event) => onChange("recipient", event.target.value)}
+            placeholder="예: 5세 여아, 60대 어머니"
+          />
+        </Field>
+        <Field label="선호" wide>
+          <input
+            value={value.preferences}
+            onChange={(event) => onChange("preferences", event.target.value)}
+            placeholder="원하는 조건을 쉼표로 구분 (예: 가벼움, 식기세척기 사용 가능)"
+          />
+        </Field>
+        <Field label="피하고 싶은 조건" wide>
+          <input
+            value={value.avoid}
+            onChange={(event) => onChange("avoid", event.target.value)}
+            placeholder="피하고 싶은 점을 쉼표로 구분 (예: 무거움, 유리 재질)"
+          />
+        </Field>
+      </div>
+      <div className="editor-actions">
+        <button className="button primary small" onClick={onSubmit}>
+          이 조건으로 다시 찾기
+        </button>
+        <button className="button ghost small" onClick={onCancel}>
+          닫기
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function RecommendationModal({ item, onClose, onSelect }) {
-  const [state, setState] = useState({
-    loading: true,
-    products: [],
-    error: "",
+  const [state, setState] = useState({ status: "loading", data: null, error: "" });
+  const [constraints, setConstraints] = useState({
+    budget: "",
+    recipient: "",
+    preferences: "",
+    avoid: "",
   });
+  const activeRef = useRef(true);
 
   useEffect(() => {
-    let active = true;
-    fetch("/api/recommend", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ item }),
-    })
-      .then(async (response) => {
-        const data = await parseApiResponse(
-          response,
-          "상품 추천에 실패했습니다.",
-        );
-        if (!response.ok)
-          throw new Error(data.error || "상품 추천을 불러오지 못했습니다.");
-        return data;
-      })
-      .then(
-        (data) =>
-          active &&
-          setState({
-            loading: false,
-            products: data.recommendations || [],
-            error: "",
-            demoMode: data.demoMode,
-          }),
-      )
-      .catch(
-        (error) =>
-          active &&
-          setState({ loading: false, products: [], error: error.message }),
-      );
+    activeRef.current = true;
     return () => {
-      active = false;
+      activeRef.current = false;
     };
-  }, [item]);
+  }, []);
+
+  const runSearch = useCallback(
+    (userConstraints) => {
+      setState({ status: "loading", data: null, error: "" });
+      fetch("/api/products/recommend", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ item, userConstraints: userConstraints || {} }),
+      })
+        .then(async (response) => {
+          const data = await parseApiResponse(
+            response,
+            "상품 추천에 실패했습니다.",
+          );
+          if (!response.ok)
+            throw new Error(data.error || "상품 추천을 불러오지 못했습니다.");
+          return data;
+        })
+        .then((data) => {
+          if (!activeRef.current) return;
+          setState({
+            status: data.needsMoreInfo ? "needsInfo" : "results",
+            data,
+            error: "",
+          });
+        })
+        .catch((error) => {
+          if (!activeRef.current) return;
+          setState({ status: "error", data: null, error: error.message });
+        });
+    },
+    [item],
+  );
+
+  useEffect(() => {
+    runSearch(null);
+  }, [runSearch]);
+
+  function updateConstraint(key, value) {
+    setConstraints((current) => ({ ...current, [key]: value }));
+  }
+
+  function submitConstraints() {
+    runSearch({ ...constraints });
+  }
+
+  function handleSelect(product) {
+    onSelect({
+      productTitle: product.title,
+      productLink: product.link,
+      productPrice: product.price ?? null,
+      productMallName: product.mallName || "",
+      productSource: product.source || "naver_shopping",
+      productImage: product.image || "",
+      deliveryInfo: product.deliveryInfo ?? product.deliveryText ?? null,
+      selectedAt: new Date().toISOString(),
+      link: product.link,
+    });
+  }
+
+  const data = state.data;
+  const recommendations = data?.recommendations || [];
+  const candidates = data?.candidates || [];
+  const showCandidateFallback =
+    state.status === "results" && !recommendations.length && candidates.length > 0;
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <section
-        className="modal"
+        className="modal recommendation-modal"
         onMouseDown={(event) => event.stopPropagation()}
       >
         <div className="modal-heading">
@@ -934,59 +1047,189 @@ function RecommendationModal({ item, onClose, onSelect }) {
             ×
           </button>
         </div>
-        <p className="modal-intro">
-          일정과 AI 권장 액션 시점을 고려해 수집된 상품 중에서 골랐어요. 배송
-          정보는 확인된 내용만 표시합니다.
-        </p>
-        {state.demoMode && (
-          <div className="notice">
-            OpenAI API 키가 없어 수집 결과를 기준으로 정렬한 데모 추천입니다.
-          </div>
+
+        {state.status === "loading" && (
+          <div className="loading">상품 후보를 모으고 분석하고 있어요...</div>
         )}
-        {state.loading && (
-          <div className="loading">상품 정보를 찾고 있어요...</div>
+
+        {state.status === "error" && (
+          <div className="error-box">{state.error}</div>
         )}
-        {state.error && <div className="error-box">{state.error}</div>}
-        <div className="product-list">
-          {state.products.map((product, index) => (
-            <article className="product-card" key={`${product.link}-${index}`}>
-              <div className="product-rank">
-                {String(index + 1).padStart(2, "0")}
-              </div>
-              <div className="product-body">
-                <h3>{product.productTitle}</h3>
-                <div className="product-meta">
-                  <strong>{product.price || "가격 확인 필요"}</strong>
-                  <span>
-                    {product.deliveryInfo || "배송 정보: 확인할 수 없음"}
-                  </span>
+
+        {state.status === "needsInfo" && (
+          <>
+            <p className="modal-intro">
+              물품 범위가 넓어 추천 정확도를 높이려면 조건이 조금 더 필요해요.
+              아래를 채워 주시면 그 조건으로 다시 찾아볼게요.
+            </p>
+            <FollowUpForm
+              questions={data?.followUpQuestions}
+              value={constraints}
+              onChange={updateConstraint}
+              onSubmit={submitConstraints}
+              onCancel={onClose}
+            />
+          </>
+        )}
+
+        {(state.status === "results" || showCandidateFallback) && data && (
+          <>
+            <div className="recommendation-context">
+              <div className="recommendation-context-grid">
+                <div>
+                  <span>물품명</span>
+                  <strong>{item.name}</strong>
                 </div>
-                <p>
-                  <b>추천 이유</b> {product.reason}
-                </p>
-                <p className="caution">
-                  <b>확인할 점</b> {product.caution}
-                </p>
-                <div className="card-actions">
-                  <a
-                    className="button ghost small"
-                    href={product.link}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    상품 보기
-                  </a>
-                  <button
-                    className="button primary small"
-                    onClick={() => onSelect(product)}
-                  >
-                    이 상품 선택
-                  </button>
+                <div>
+                  <span>관련 일정</span>
+                  <strong>{item.eventName || "관련 일정 없음"}</strong>
+                </div>
+                <div>
+                  <span>수집된 상품 후보</span>
+                  <strong>{candidates.length}개</strong>
+                </div>
+                <div>
+                  <span>데이터 소스</span>
+                  <strong>
+                    {data.naverMock
+                      ? "예시 데이터 (네이버 API 키 없음)"
+                      : "네이버 쇼핑 API + 공개 페이지 일부 수집"}
+                  </strong>
                 </div>
               </div>
-            </article>
-          ))}
-        </div>
+              {data.searchPlan?.recommendationCriteria?.length > 0 && (
+                <div className="recommendation-criteria">
+                  <span>AI가 본 추천 기준</span>
+                  <div className="criteria-chips">
+                    {data.searchPlan.recommendationCriteria.map(
+                      (criterion, index) => (
+                        <em key={index}>{criterion}</em>
+                      ),
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {data.naverMock && (
+              <div className="notice">
+                네이버 쇼핑 API 키가 없어 예시 상품을 보여드리고 있어요.
+              </div>
+            )}
+            {data.recommendationMock && !data.naverMock && (
+              <div className="notice">
+                OpenAI API 키가 없어 수집 결과를 기준으로 정리한 데모 추천이에요.
+              </div>
+            )}
+            {data.recommendationFailed && (
+              <div className="notice">
+                AI 추천 이유를 생성하지 못해 검색 결과를 먼저 보여드려요.
+              </div>
+            )}
+            {data.relaxedFilter && (
+              <div className="notice">
+                검색 결과가 적어 일부 관련 상품을 함께 보여드려요.
+              </div>
+            )}
+
+            {data.summary && <p className="recommendation-summary">{data.summary}</p>}
+
+            <div className="product-list">
+              {recommendations.map((product, index) => (
+                <article
+                  className="product-card recommendation-card"
+                  key={`${product.link}-${index}`}
+                >
+                  <ProductImage src={product.image} alt={product.title} />
+                  <div className="product-body">
+                    <div className="product-label-row">
+                      <Badge tone="sage">{product.label || "후보"}</Badge>
+                      {product.mallName && <span>{product.mallName}</span>}
+                    </div>
+                    <h3>{product.title}</h3>
+                    <div className="product-meta">
+                      <strong>{formatPrice(product.price)}</strong>
+                      <span>{deliveryLabel(product)}</span>
+                    </div>
+                    <p>
+                      <b>추천 이유</b> {product.fitReason}
+                    </p>
+                    <p className="caution">
+                      <b>확인할 점</b> {product.caution}
+                    </p>
+                    {product.matchedCriteria?.length > 0 && (
+                      <div className="criteria-chips small">
+                        {product.matchedCriteria.map((criterion, idx) => (
+                          <em key={idx}>{criterion}</em>
+                        ))}
+                      </div>
+                    )}
+                    <div className="card-actions">
+                      <a
+                        className="button ghost small"
+                        href={product.link}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        링크 열기
+                      </a>
+                      <button
+                        className="button primary small"
+                        onClick={() => handleSelect(product)}
+                      >
+                        구매할 상품으로 선택
+                      </button>
+                    </div>
+                  </div>
+                </article>
+              ))}
+
+              {showCandidateFallback &&
+                candidates.slice(0, 3).map((product, index) => (
+                  <article
+                    className="product-card recommendation-card"
+                    key={`${product.link}-${index}`}
+                  >
+                    <ProductImage src={product.image} alt={product.title} />
+                    <div className="product-body">
+                      <div className="product-label-row">
+                        {product.mallName && <span>{product.mallName}</span>}
+                      </div>
+                      <h3>{product.title}</h3>
+                      <div className="product-meta">
+                        <strong>{formatPrice(product.price)}</strong>
+                        <span>{deliveryLabel(product)}</span>
+                      </div>
+                      <div className="card-actions">
+                        <a
+                          className="button ghost small"
+                          href={product.link}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          링크 열기
+                        </a>
+                        <button
+                          className="button primary small"
+                          onClick={() => handleSelect(product)}
+                        >
+                          구매할 상품으로 선택
+                        </button>
+                      </div>
+                    </div>
+                  </article>
+                ))}
+            </div>
+
+            {data.limitations?.length > 0 && (
+              <ul className="recommendation-limitations">
+                {data.limitations.map((limitation, index) => (
+                  <li key={index}>{limitation}</li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
       </section>
     </div>
   );

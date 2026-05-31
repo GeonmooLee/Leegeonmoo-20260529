@@ -57,6 +57,119 @@ app.post("/api/recommend", async (request, response) => {
   }
 });
 
+app.post("/api/products/recommend", async (request, response) => {
+  const item = sanitizeProductItem(request.body?.item);
+  const userConstraints = sanitizeUserConstraints(request.body?.userConstraints);
+  if (!item.itemName) {
+    return response.status(400).json({ error: "추천할 물품 이름이 필요합니다." });
+  }
+
+  const naverConfigured = Boolean(
+    process.env.NAVER_CLIENT_ID && process.env.NAVER_CLIENT_SECRET,
+  );
+  const openAiConfigured = Boolean(process.env.OPENAI_API_KEY);
+
+  try {
+    const searchPlan = await buildSearchPlan(item, userConstraints);
+
+    if (searchPlan.needsMoreInfo && !hasUserConstraints(userConstraints)) {
+      return response.json({
+        needsMoreInfo: true,
+        followUpQuestions: searchPlan.followUpQuestions,
+        searchPlan,
+        candidates: [],
+        recommendations: [],
+        summary: "",
+        limitations: [],
+        naverConfigured,
+        openAiConfigured,
+      });
+    }
+
+    let candidates = [];
+    let naverMock = false;
+    if (naverConfigured) {
+      candidates = await searchProductsWithPlan(searchPlan, item);
+    } else {
+      candidates = createMockCandidates(item, searchPlan);
+      naverMock = true;
+    }
+
+    if (!candidates.length) {
+      return response.status(502).json({
+        error: "상품 후보를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.",
+      });
+    }
+
+    const { filtered, relaxedFilter } = filterCandidates(candidates, searchPlan, item);
+
+    let summary = "";
+    let recommendations = [];
+    let limitations = [
+      "배송일은 판매처별로 달라 정확히 보장할 수 없습니다.",
+      "추천은 네이버 쇼핑 API와 제한적 크롤링 데이터 기반입니다.",
+    ];
+    let recommendationFailed = false;
+    try {
+      const result = await buildRecommendations(item, searchPlan, filtered);
+      summary = result.summary;
+      recommendations = result.recommendations;
+      if (result.limitations?.length) limitations = result.limitations;
+    } catch (error) {
+      console.warn("Product recommendation generation failed:", error.message);
+      recommendationFailed = true;
+    }
+
+    // 최종 추천(또는 폴백 상위 3개) 상품에 대해서만 가벼운 정적 크롤링을 시도한다.
+    const linksToCrawl = recommendations.length
+      ? recommendations.map((rec) => rec.link)
+      : filtered.slice(0, 3).map((candidate) => candidate.link);
+    const deliveryByLink = await crawlLinksForDelivery(linksToCrawl);
+
+    recommendations = recommendations.map((rec) => {
+      const crawled = deliveryByLink.get(rec.link);
+      if (!crawled) return rec;
+      return {
+        ...rec,
+        deliveryInfo: rec.deliveryInfo || crawled.deliveryText || null,
+        crawlStatus: crawled.status,
+      };
+    });
+
+    const publicCandidates = filtered.map((candidate) => {
+      const base = toPublicCandidate(candidate);
+      const crawled = deliveryByLink.get(candidate.link);
+      if (!crawled) return base;
+      return {
+        ...base,
+        deliveryText: base.deliveryText || crawled.deliveryText || null,
+        crawlStatus: crawled.status,
+      };
+    });
+
+    return response.json({
+      needsMoreInfo: false,
+      followUpQuestions: [],
+      searchPlan,
+      candidates: publicCandidates,
+      recommendations,
+      summary,
+      limitations,
+      relaxedFilter,
+      naverConfigured,
+      openAiConfigured,
+      naverMock,
+      recommendationMock: !openAiConfigured,
+      recommendationFailed,
+    });
+  } catch (error) {
+    console.error("Product recommendation failed:", error.message);
+    return response.status(502).json({
+      error: "상품 후보를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.",
+    });
+  }
+});
+
 const distPath = path.join(__dirname, "dist");
 app.use(express.static(distPath));
 app.get("*", (_request, response) => response.sendFile(path.join(distPath, "index.html")));
@@ -283,7 +396,19 @@ function itemSchema() {
   };
 }
 
-async function callOpenAI({ instructions, input, schemaName, schema }) {
+function extractionModel() {
+  return process.env.OPENAI_MODEL || "gpt-5-mini";
+}
+
+function recommendationModel() {
+  return (
+    process.env.OPENAI_RECOMMEND_MODEL ||
+    process.env.OPENAI_MODEL ||
+    "gpt-5-mini"
+  );
+}
+
+async function callOpenAI({ instructions, input, schemaName, schema, model }) {
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -291,7 +416,7 @@ async function callOpenAI({ instructions, input, schemaName, schema }) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || "gpt-5-mini",
+      model: model || extractionModel(),
       instructions,
       input,
       text: {
@@ -748,4 +873,573 @@ function addCalendarDays(isoDate, days) {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+// ---------------------------------------------------------------------------
+// AI 상품 찾기: 네이버 쇼핑 API + 경량 크롤링 + OpenAI 후보 추천 파이프라인
+// ---------------------------------------------------------------------------
+
+const broadItemTerms = ["선물", "옷", "신발", "가방", "장난감", "생신", "집들이", "용품"];
+const recommendationLabels = ["가장 먼저 볼 후보", "가성비 후보", "신중히 볼 후보"];
+
+function sanitizeProductItem(value = {}) {
+  const itemName = String(value.itemName || value.name || "").slice(0, 120);
+  return {
+    itemName,
+    relatedEvent: String(value.relatedEvent || value.eventName || "").slice(0, 160),
+    neededDate: value.neededDate || null,
+    recommendedActionTimingText: String(
+      value.recommendedActionTimingText || "",
+    ).slice(0, 500),
+    recommendedActionType: String(value.recommendedActionType || "").slice(0, 40),
+    actionReason: String(value.actionReason || value.reason || "").slice(0, 800),
+    note: String(value.note || "").slice(0, 500),
+    userIntent: String(value.userIntent || "unknown").slice(0, 40),
+  };
+}
+
+function sanitizeUserConstraints(value = {}) {
+  const toList = (input) =>
+    (Array.isArray(input) ? input : String(input || "").split(/[,\n]/))
+      .map((entry) => String(entry).trim())
+      .filter(Boolean)
+      .slice(0, 10);
+  return {
+    budget: String(value.budget || "").slice(0, 120),
+    recipient: String(value.recipient || "").slice(0, 120),
+    preferences: toList(value.preferences),
+    avoid: toList(value.avoid),
+  };
+}
+
+function hasUserConstraints(constraints = {}) {
+  return Boolean(
+    constraints.budget ||
+      constraints.recipient ||
+      constraints.preferences?.length ||
+      constraints.avoid?.length,
+  );
+}
+
+async function buildSearchPlan(item, userConstraints) {
+  if (!process.env.OPENAI_API_KEY) {
+    return createDemoSearchPlan(item, userConstraints);
+  }
+  try {
+    return await generateSearchPlanWithOpenAI(item, userConstraints);
+  } catch (error) {
+    console.warn("Search plan generation failed, using heuristic:", error.message);
+    return createDemoSearchPlan(item, userConstraints);
+  }
+}
+
+async function generateSearchPlanWithOpenAI(item, userConstraints) {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      refinedSearchQueries: { type: "array", items: { type: "string" }, maxItems: 6 },
+      recommendationCriteria: { type: "array", items: { type: "string" } },
+      avoidCriteria: { type: "array", items: { type: "string" } },
+      needsMoreInfo: { type: "boolean" },
+      followUpQuestions: { type: "array", items: { type: "string" } },
+    },
+    required: [
+      "refinedSearchQueries",
+      "recommendationCriteria",
+      "avoidCriteria",
+      "needsMoreInfo",
+      "followUpQuestions",
+    ],
+  };
+
+  const plan = await callOpenAI({
+    instructions: [
+      "당신은 한국어 가족 구매 도우미의 상품 검색 전략가입니다.",
+      "사용자 물품 맥락(item)과 보완 조건(userConstraints)을 보고 네이버 쇼핑 검색에 쓸 전략을 만드세요.",
+      "refinedSearchQueries는 네이버 쇼핑에서 잘 검색되는 한국어 검색어 2~5개입니다. 일정과 대상, 사용 맥락을 반영해 구체화하세요.",
+      "recommendationCriteria는 이 사용자 상황에서 좋은 후보를 고르는 기준입니다. note, actionReason, userIntent를 반영하세요.",
+      "avoidCriteria는 피해야 할 후보의 특징입니다.",
+      "물품명이 '생신 선물', '집들이 선물', '옷', '신발', '가방', '장난감'처럼 너무 넓어 검색어를 구체화하기 어렵고 보완 조건도 비어 있으면 needsMoreInfo=true로 두고 followUpQuestions에 예산, 대상, 선호, 피하고 싶은 조건을 묻는 짧은 질문을 넣으세요.",
+      "보완 조건(userConstraints)에 예산, 대상, 선호, 피할 조건이 하나라도 있으면 needsMoreInfo=false로 두고 그 정보를 검색어와 기준에 반영하세요.",
+      "충분히 구체적인 물품이면 needsMoreInfo=false, followUpQuestions=[]로 두세요.",
+      "실제 상품이나 배송일을 상상하지 마세요. 여기서는 검색 전략만 만듭니다.",
+    ].join("\n"),
+    input: JSON.stringify({ item, userConstraints }, null, 2),
+    schemaName: "product_search_plan",
+    schema,
+    model: recommendationModel(),
+  });
+
+  return {
+    refinedSearchQueries: (plan.refinedSearchQueries || []).filter(Boolean),
+    recommendationCriteria: plan.recommendationCriteria || [],
+    avoidCriteria: plan.avoidCriteria || [],
+    needsMoreInfo: Boolean(plan.needsMoreInfo),
+    followUpQuestions: plan.followUpQuestions || [],
+  };
+}
+
+function createDemoSearchPlan(item, userConstraints) {
+  const needsMoreInfo =
+    !hasUserConstraints(userConstraints) &&
+    broadItemTerms.some((term) => item.itemName.includes(term));
+  const queries = buildDemoQueries(item, userConstraints);
+  return {
+    refinedSearchQueries: queries,
+    recommendationCriteria: [
+      "메모 맥락과 사용 목적에 맞는 제품",
+      "가격이 과하지 않은 제품",
+      item.note ? `비고 반영: ${item.note}` : "일정 전에 준비 가능한 제품",
+    ].filter(Boolean),
+    avoidCriteria: ["사용 맥락과 맞지 않는 제품", "구조가 복잡하거나 과한 제품"],
+    needsMoreInfo,
+    followUpQuestions: needsMoreInfo
+      ? ["예산, 대상, 선호, 피하고 싶은 조건을 알려주시면 더 잘 찾을 수 있어요."]
+      : [],
+  };
+}
+
+function buildDemoQueries(item, userConstraints) {
+  const base = item.itemName.trim();
+  const prefixes = [];
+  if (userConstraints.recipient) prefixes.push(userConstraints.recipient);
+  (userConstraints.preferences || []).slice(0, 2).forEach((pref) => prefixes.push(pref));
+  const queries = [base];
+  prefixes.forEach((prefix) => queries.push(`${prefix} ${base}`.trim()));
+  return [...new Set(queries.filter(Boolean))].slice(0, 5);
+}
+
+async function searchProductsWithPlan(searchPlan, item) {
+  const queries = searchPlan.refinedSearchQueries.length
+    ? searchPlan.refinedSearchQueries
+    : [item.itemName];
+
+  let candidates = await searchNaverShopping(queries[0], 10).catch((error) => {
+    console.warn("Naver shopping search failed:", error.message);
+    return [];
+  });
+
+  if (candidates.length < 3 && queries[1]) {
+    const more = await searchNaverShopping(queries[1], 10).catch(() => []);
+    candidates = dedupeByLink([...candidates, ...more]);
+  }
+  return candidates;
+}
+
+async function searchNaverShopping(query, display = 10) {
+  const url = `https://openapi.naver.com/v1/search/shop.json?query=${encodeURIComponent(
+    query,
+  )}&display=${display}&sort=sim`;
+  const apiResponse = await fetch(url, {
+    headers: {
+      "X-Naver-Client-Id": process.env.NAVER_CLIENT_ID,
+      "X-Naver-Client-Secret": process.env.NAVER_CLIENT_SECRET,
+    },
+    signal: AbortSignal.timeout(7000),
+  });
+  if (!apiResponse.ok) {
+    const body = await apiResponse.text();
+    throw new Error(`Naver shopping API ${apiResponse.status}: ${body.slice(0, 300)}`);
+  }
+  const data = await apiResponse.json();
+  return (data.items || []).map(normalizeNaverItem);
+}
+
+function normalizeNaverItem(raw = {}) {
+  const category = [raw.category1, raw.category2, raw.category3, raw.category4]
+    .filter(Boolean)
+    .join(" > ");
+  const price = Number(raw.lprice) || Number(raw.hprice) || null;
+  return {
+    title: stripHtml(raw.title),
+    price,
+    mallName: raw.mallName || "",
+    source: "naver_shopping",
+    link: raw.link || "",
+    image: raw.image || "",
+    brand: raw.brand || raw.maker || "",
+    category,
+    productId: raw.productId || "",
+    deliveryText: null,
+    crawledInfo: { status: "pending" },
+  };
+}
+
+function stripHtml(value = "") {
+  return cleanText(String(value).replace(/<[^>]*>/g, ""))
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function dedupeByLink(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    if (!item.link || seen.has(item.link)) return false;
+    seen.add(item.link);
+    return true;
+  });
+}
+
+const crawlUserAgent =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function run() {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index], index);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, run),
+  );
+  return results;
+}
+
+// 최종 추천 상품(최대 3~5개)에 대해서만 가벼운 정적 크롤링으로 공개 메타데이터를 수집한다.
+// 네이버 스마트스토어 등은 봇 요청을 차단하므로 배송 정보는 대부분 얻지 못하며,
+// 그 경우 UI에서 사용자가 상세 페이지에서 직접 확인하도록 안내한다.
+async function crawlLinksForDelivery(links) {
+  const uniqueLinks = [...new Set((links || []).filter(Boolean))].slice(0, 5);
+  const deliveryByLink = new Map();
+  if (!uniqueLinks.length) return deliveryByLink;
+
+  await mapWithConcurrency(uniqueLinks, 3, async (link) => {
+    const info = await crawlProductPage(link);
+    deliveryByLink.set(link, {
+      deliveryText: info.deliveryText || null,
+      status: info.status,
+    });
+  });
+
+  return deliveryByLink;
+}
+
+async function crawlProductPage(link) {
+  if (!link) return { status: "failed" };
+  try {
+    const pageResponse = await fetch(link, {
+      headers: {
+        "User-Agent": crawlUserAgent,
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.7",
+      },
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!pageResponse.ok) return { status: "failed" };
+
+    const html = await pageResponse.text();
+    const $ = cheerio.load(html);
+    const pageTitle = cleanText($("title").first().text()).slice(0, 200);
+    const metaDescription = cleanText(
+      $('meta[name="description"]').attr("content") || "",
+    ).slice(0, 300);
+    const ogTitle = cleanText($('meta[property="og:title"]').attr("content") || "").slice(0, 200);
+    const ogDescription = cleanText(
+      $('meta[property="og:description"]').attr("content") || "",
+    ).slice(0, 300);
+    const bodyText = cleanText($("body").text());
+    const pageSnippet = bodyText.slice(0, 300);
+    const deliveryText = extractDeliveryFromText(
+      `${metaDescription} ${ogDescription} ${bodyText.slice(0, 4000)}`,
+    );
+
+    return {
+      status: "success",
+      pageTitle,
+      metaDescription,
+      ogTitle,
+      ogDescription,
+      pageSnippet,
+      deliveryText,
+    };
+  } catch {
+    return { status: "failed" };
+  }
+}
+
+function extractDeliveryFromText(text) {
+  const value = String(text);
+  const patterns = [
+    /오늘\s*출발/,
+    /당일\s*(?:발송|배송|출발)/,
+    /내일\s*도착/,
+    /모레\s*도착/,
+    /새벽\s*배송/,
+    /도착\s*보장/,
+    /평균\s*\d+\s*일\s*이내\s*도착/,
+    /\d+\.\d+\s*\([월화수목금토일]\)\s*발송\s*예정/,
+    /무료\s*배송/,
+    /빠른\s*배송/,
+    /해외\s*배송/,
+    /예약\s*배송/,
+    /주문\s*제작/,
+    /배송비\s*[\d,]+\s*원/,
+  ];
+  const found = [];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (match) {
+      const phrase = cleanText(match[0]);
+      if (phrase && !found.includes(phrase)) found.push(phrase);
+    }
+    if (found.length >= 3) break;
+  }
+  return found.length ? found.join(" · ") : null;
+}
+
+function filterCandidates(candidates, searchPlan, item) {
+  const seenTitles = new Set();
+  const valid = candidates.filter((candidate) => {
+    const titleKey = normalizeItemName(candidate.title);
+    if (!candidate.title || !candidate.link || !titleKey) return false;
+    if (seenTitles.has(titleKey)) return false;
+    seenTitles.add(titleKey);
+    return true;
+  });
+
+  const withPrice = valid.filter((candidate) => candidate.price);
+  const ranked = withPrice.length >= 3 ? withPrice : valid;
+
+  const keywords = buildKeywords(item, searchPlan);
+  const relevant = ranked.filter((candidate) =>
+    keywords.some((keyword) => candidate.title.includes(keyword)),
+  );
+
+  if (relevant.length >= 3) {
+    return { filtered: relevant.slice(0, 10), relaxedFilter: false };
+  }
+  return {
+    filtered: ranked.slice(0, 10),
+    relaxedFilter: relevant.length < ranked.length,
+  };
+}
+
+function buildKeywords(item, searchPlan) {
+  const tokens = new Set();
+  const collect = (value) =>
+    String(value || "")
+      .split(/\s+/)
+      .forEach((token) => {
+        if (token.length >= 2) tokens.add(token);
+      });
+  collect(item.itemName);
+  (searchPlan.refinedSearchQueries || []).forEach(collect);
+  return [...tokens];
+}
+
+async function buildRecommendations(item, searchPlan, candidates) {
+  if (!process.env.OPENAI_API_KEY) {
+    return recommendCandidatesForDemo(item, candidates);
+  }
+  const result = await recommendProductsFromCandidatesWithOpenAI(
+    item,
+    searchPlan,
+    candidates,
+  );
+  const recommendations = reconcileRecommendations(result.recommendations, candidates);
+  return {
+    summary: result.summary,
+    recommendations,
+    limitations: result.limitations,
+  };
+}
+
+async function recommendProductsFromCandidatesWithOpenAI(item, searchPlan, candidates) {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      summary: { type: "string" },
+      recommendations: {
+        type: "array",
+        maxItems: 3,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            rank: { type: "number" },
+            label: {
+              type: "string",
+              enum: recommendationLabels,
+            },
+            title: { type: "string" },
+            price: { type: ["number", "null"] },
+            mallName: { type: "string" },
+            source: { type: "string" },
+            link: { type: "string" },
+            image: { type: "string" },
+            deliveryInfo: { type: ["string", "null"] },
+            fitReason: { type: "string" },
+            caution: { type: "string" },
+            matchedCriteria: { type: "array", items: { type: "string" } },
+          },
+          required: [
+            "rank",
+            "label",
+            "title",
+            "price",
+            "mallName",
+            "source",
+            "link",
+            "image",
+            "deliveryInfo",
+            "fitReason",
+            "caution",
+            "matchedCriteria",
+          ],
+        },
+      },
+      limitations: { type: "array", items: { type: "string" } },
+    },
+    required: ["summary", "recommendations", "limitations"],
+  };
+
+  return callOpenAI({
+    instructions: [
+      "당신은 한국어 가족 구매 도우미의 상품 추천가입니다.",
+      "item context, 추천 기준, 그리고 수집된 상품 후보(productCandidates)를 보고 최대 3개를 추천하세요.",
+      "반드시 productCandidates 안에 있는 상품만 추천하세요. 새 상품을 상상하거나 만들지 마세요.",
+      "각 추천의 link는 후보의 link와 정확히 같아야 합니다.",
+      "title, price, mallName, source, image, deliveryInfo는 해당 후보의 값을 그대로 복사하세요.",
+      "deliveryInfo는 후보의 deliveryText 또는 crawledInfo에서 확인된 값만 사용하고, 확인할 수 없으면 null로 두세요. 배송일을 추측하지 마세요.",
+      "label은 '가장 먼저 볼 후보', '가성비 후보', '신중히 볼 후보' 중에서 고르세요.",
+      "fitReason은 관련 일정, 필요 날짜, AI 권장 액션 시점, 비고, 사용자 의도, 배송 정보 확인 가능 여부 중 실제로 관련된 맥락을 반영해 구체적으로 쓰세요. '좋아 보입니다' 같은 막연한 표현은 금지합니다.",
+      "matchedCriteria는 recommendationCriteria 중 이 후보가 충족하는 항목을 골라 담으세요.",
+      "summary는 이 물품을 고를 때 먼저 봐야 할 점을 한두 문장으로 설명하세요.",
+      "limitations에는 배송 보장 불가, 제한된 데이터 기반 추천이라는 점을 한국어로 담으세요.",
+    ].join("\n"),
+    input: JSON.stringify(
+      {
+        item,
+        refinedSearchQueries: searchPlan.refinedSearchQueries,
+        recommendationCriteria: searchPlan.recommendationCriteria,
+        avoidCriteria: searchPlan.avoidCriteria,
+        productCandidates: candidates.map(toModelCandidate),
+      },
+      null,
+      2,
+    ),
+    schemaName: "product_recommendations_v2",
+    schema,
+    model: recommendationModel(),
+  });
+}
+
+function reconcileRecommendations(recommendations = [], candidates = []) {
+  const byLink = new Map(candidates.map((candidate) => [candidate.link, candidate]));
+  return recommendations
+    .map((recommendation) => {
+      const match = byLink.get(recommendation.link);
+      if (!match) return null;
+      return {
+        ...recommendation,
+        title: match.title,
+        price: match.price,
+        mallName: match.mallName,
+        source: match.source,
+        image: match.image,
+        link: match.link,
+        deliveryInfo: match.deliveryText,
+        crawlStatus: match.crawledInfo?.status || "unknown",
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 3);
+}
+
+function recommendCandidatesForDemo(item, candidates) {
+  const top = candidates.slice(0, 3);
+  return {
+    summary: `${item.itemName} 후보를 수집했어요. OpenAI 키가 없어 수집 순서를 기준으로 정리했습니다.`,
+    recommendations: top.map((candidate, index) => ({
+      rank: index + 1,
+      label: recommendationLabels[index] || "후보",
+      title: candidate.title,
+      price: candidate.price,
+      mallName: candidate.mallName,
+      source: candidate.source,
+      link: candidate.link,
+      image: candidate.image,
+      deliveryInfo: candidate.deliveryText,
+      crawlStatus: candidate.crawledInfo?.status || "unknown",
+      fitReason: `${item.relatedEvent || "관련 일정"}에 쓸 ${item.itemName} 후보예요. ${
+        item.recommendedActionTimingText || "권장 액션 시점"
+      }을 참고해 상세페이지에서 조건을 확인해 주세요.`,
+      caution: candidate.deliveryText
+        ? "상세페이지에서 옵션과 실제 도착 예정일을 다시 확인해 주세요."
+        : "배송 정보를 확인하지 못했어요. 결제 전에 도착 가능일을 꼭 확인해 주세요.",
+      matchedCriteria: [],
+    })),
+    limitations: [
+      "배송일은 판매처별로 달라 정확히 보장할 수 없습니다.",
+      "추천은 네이버 쇼핑 API와 제한적 크롤링 데이터 기반입니다.",
+    ],
+  };
+}
+
+function toModelCandidate(candidate) {
+  const crawledInfo =
+    candidate.crawledInfo?.status === "success"
+      ? {
+          status: "success",
+          pageTitle: candidate.crawledInfo.pageTitle,
+          metaDescription: candidate.crawledInfo.metaDescription,
+          ogTitle: candidate.crawledInfo.ogTitle,
+          ogDescription: candidate.crawledInfo.ogDescription,
+          pageSnippet: candidate.crawledInfo.pageSnippet,
+        }
+      : { status: candidate.crawledInfo?.status || "failed" };
+  return {
+    title: candidate.title,
+    price: candidate.price,
+    mallName: candidate.mallName,
+    source: candidate.source,
+    link: candidate.link,
+    image: candidate.image,
+    brand: candidate.brand,
+    category: candidate.category,
+    deliveryText: candidate.deliveryText,
+    crawledInfo,
+  };
+}
+
+function toPublicCandidate(candidate) {
+  return {
+    title: candidate.title,
+    price: candidate.price,
+    mallName: candidate.mallName,
+    source: candidate.source,
+    link: candidate.link,
+    image: candidate.image,
+    brand: candidate.brand,
+    category: candidate.category,
+    deliveryText: candidate.deliveryText,
+    crawlStatus: candidate.crawledInfo?.status || "unknown",
+  };
+}
+
+function createMockCandidates(item, searchPlan) {
+  const query = searchPlan.refinedSearchQueries[0] || item.itemName;
+  const searchLink = `https://search.shopping.naver.com/search/all?query=${encodeURIComponent(
+    query,
+  )}`;
+  return [1, 2, 3].map((index) => ({
+    title: `${item.itemName} 예시 후보 ${index}`,
+    price: 9900 * index,
+    mallName: "예시몰",
+    source: "mock",
+    link: `${searchLink}&example=${index}`,
+    image: "",
+    brand: "",
+    category: "",
+    productId: `mock-${index}`,
+    deliveryText: index === 1 ? "무료배송" : null,
+    crawledInfo: { status: "skipped" },
+  }));
 }
