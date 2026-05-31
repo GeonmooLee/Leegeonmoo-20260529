@@ -1,15 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "./router.js";
 
-const DEFAULT_MEMO =
-  "다음 주 금요일에 지우 유치원 소풍. 도시락통 새로 사야 하고 물통도 괜찮은지 모르겠고, 돗자리는 집에 있는지 확인해 봐야 함. 다음 달 초에는 엄마 생신 선물도 봐야 함. 남편 와이셔츠도 계속 미뤘네.";
-
-const tabs = [
-  ["memo", "메모", "01"],
-  ["suggestions", "AI 제안", "02"],
-  ["list", "구매 리스트", "03"],
-  ["today", "오늘의 구매", "04"],
-];
-
+const LEGACY_MEMO_ID = "memo-legacy";
 const priorityRank = { 높음: 0, 중간: 1, 낮음: 2 };
 const sourceLabels = {
   mentioned: "사용자 언급 물품",
@@ -21,14 +13,20 @@ function uid(prefix = "item") {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function readStored(key, fallback) {
+  try {
+    const saved = localStorage.getItem(key);
+    return saved ? JSON.parse(saved) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function useStoredState(key, initialValue) {
   const [value, setValue] = useState(() => {
-    try {
-      const saved = localStorage.getItem(key);
-      return saved ? JSON.parse(saved) : initialValue;
-    } catch {
-      return initialValue;
-    }
+    const fallback =
+      typeof initialValue === "function" ? initialValue() : initialValue;
+    return readStored(key, fallback);
   });
 
   useEffect(() => {
@@ -36,6 +34,56 @@ function useStoredState(key, initialValue) {
   }, [key, value]);
 
   return [value, setValue];
+}
+
+function createLegacyMemos() {
+  const content = readStored("salddeut.memo", "");
+  if (!content?.trim()) return [];
+
+  return [
+    {
+      id: LEGACY_MEMO_ID,
+      title: makeMemoTitle(content),
+      content,
+      createdAt: new Date().toISOString(),
+    },
+  ];
+}
+
+function createLegacyAnalyses() {
+  const items = readStored("salddeut.suggestions", []);
+  if (!items.length) return {};
+
+  const eventNames = readStored("salddeut.suggestionEvents", []);
+  const meta = readStored("salddeut.analysisMeta", {});
+  return {
+    [LEGACY_MEMO_ID]: {
+      memoId: LEGACY_MEMO_ID,
+      eventNames: eventNames.length
+        ? eventNames
+        : [...new Set(items.map((item) => item.eventName || "기타 구매"))],
+      items,
+      analyzedAt: meta?.createdAt || new Date().toISOString(),
+      demoMode: Boolean(meta?.demoMode),
+    },
+  };
+}
+
+function createLegacyShoppingList() {
+  return readStored("salddeut.purchaseList", []).map((item) => ({
+    ...item,
+    sourceMemoId: item.sourceMemoId || LEGACY_MEMO_ID,
+    analysisItemId: item.analysisItemId || item.suggestionId || null,
+  }));
+}
+
+function makeMemoTitle(content) {
+  const firstLine = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  if (!firstLine) return "제목 없는 메모";
+  return firstLine.length > 34 ? `${firstLine.slice(0, 34)}...` : firstLine;
 }
 
 function formatDate(value) {
@@ -47,29 +95,38 @@ function formatDate(value) {
   }).format(new Date(`${value}T00:00:00`));
 }
 
-function dateDiff(value) {
-  if (!value) return Number.POSITIVE_INFINITY;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  return Math.ceil((new Date(`${value}T00:00:00`) - today) / 86400000);
+function formatCreatedAt(value) {
+  if (!value) return "-";
+  return new Intl.DateTimeFormat("ko-KR", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  }).format(new Date(value));
 }
 
 function toInputDate(value) {
   return value || "";
 }
 
+function normalize(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
 function flattenEvents(events = []) {
   return events.flatMap((event) => {
     const mentioned = (event.mentionedItems || []).map((item) => ({
       ...item,
-      id: item.id || uid("mention"),
-      eventName: item.eventName || event.eventName,
+      id: uid("mention"),
+      eventName: item.eventName || event.eventName || "기타 구매",
       sourceType: "mentioned",
     }));
     const suggested = (event.suggestedItems || []).map((item) => ({
       ...item,
-      id: item.id || uid("suggestion"),
-      eventName: item.eventName || event.eventName,
+      id: uid("suggestion"),
+      eventName: item.eventName || event.eventName || "기타 구매",
       sourceType: "suggested",
     }));
     return [...mentioned, ...suggested];
@@ -85,38 +142,68 @@ function Field({ label, children, wide = false }) {
   );
 }
 
-function ItemEditor({ item, onSave, onCancel, compact = false }) {
+function ItemEditor({ item, onSave, onCancel }) {
   const [draft, setDraft] = useState(item);
-  const update = (key, value) => setDraft((current) => ({ ...current, [key]: value }));
+  const update = (key, value) =>
+    setDraft((current) => ({ ...current, [key]: value }));
 
   return (
-    <div className={`editor ${compact ? "compact" : ""}`}>
+    <div className="editor">
       <div className="editor-grid">
         <Field label="물품명">
-          <input value={draft.name || ""} onChange={(e) => update("name", e.target.value)} />
+          <input
+            value={draft.name || ""}
+            onChange={(event) => update("name", event.target.value)}
+          />
         </Field>
         <Field label="관련 일정">
-          <input value={draft.eventName || ""} onChange={(e) => update("eventName", e.target.value)} />
+          <input
+            value={draft.eventName || ""}
+            onChange={(event) => update("eventName", event.target.value)}
+          />
         </Field>
         <Field label="필요 날짜">
-          <input type="date" value={toInputDate(draft.neededDate)} onChange={(e) => update("neededDate", e.target.value || null)} />
+          <input
+            type="date"
+            value={toInputDate(draft.neededDate)}
+            onChange={(event) =>
+              update("neededDate", event.target.value || null)
+            }
+          />
         </Field>
         <Field label="구매 마감일">
-          <input type="date" value={toInputDate(draft.purchaseDeadline)} onChange={(e) => update("purchaseDeadline", e.target.value || null)} />
+          <input
+            type="date"
+            value={toInputDate(draft.purchaseDeadline)}
+            onChange={(event) =>
+              update("purchaseDeadline", event.target.value || null)
+            }
+          />
         </Field>
         <Field label="우선순위">
-          <select value={draft.priority || "중간"} onChange={(e) => update("priority", e.target.value)}>
+          <select
+            value={draft.priority || "중간"}
+            onChange={(event) => update("priority", event.target.value)}
+          >
             <option>높음</option>
             <option>중간</option>
             <option>낮음</option>
           </select>
         </Field>
         <Field label="비고" wide>
-          <input value={draft.note || ""} onChange={(e) => update("note", e.target.value)} placeholder="선호, 사이즈, 확인할 점" />
+          <input
+            value={draft.note || ""}
+            onChange={(event) => update("note", event.target.value)}
+            placeholder="선호, 사이즈, 확인할 점"
+          />
         </Field>
       </div>
       <div className="editor-actions">
-        <button className="button primary small" onClick={() => onSave(draft)} disabled={!draft.name?.trim()}>
+        <button
+          className="button primary small"
+          onClick={() => onSave(draft)}
+          disabled={!draft.name?.trim()}
+        >
           저장
         </button>
         <button className="button ghost small" onClick={onCancel}>
@@ -131,9 +218,124 @@ function Badge({ children, tone = "neutral" }) {
   return <span className={`badge ${tone}`}>{children}</span>;
 }
 
-function SuggestionCard({ item, onAdd, onDelete, onUpdate }) {
+function EmptyState({ title, description, action }) {
+  return (
+    <div className="empty-state">
+      <div className="empty-mark">+</div>
+      <h3>{title}</h3>
+      <p>{description}</p>
+      {action}
+    </div>
+  );
+}
+
+function MemoCard({
+  memo,
+  analysis,
+  addedItems,
+  isLoading,
+  onOpenDetail,
+  onAnalyze,
+  onOpenAnalysis,
+}) {
+  const addedCount = addedItems.length;
+
+  return (
+    <article
+      className="memo-list-card"
+      role="link"
+      tabIndex="0"
+      onClick={onOpenDetail}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpenDetail();
+        }
+      }}
+    >
+      <div className="memo-list-heading">
+        <div>
+          <Badge tone={analysis ? "sage" : "apricot"}>
+            {analysis ? "분석 완료" : "분석 전"}
+          </Badge>
+          <h3>{memo.title || makeMemoTitle(memo.content)}</h3>
+        </div>
+        <time>{formatCreatedAt(memo.createdAt)}</time>
+      </div>
+      <p className="memo-preview">{memo.content}</p>
+      <div className="memo-card-footer">
+        {analysis && (
+          <span
+            className={`memo-added-items ${addedCount ? "has-tooltip" : ""}`}
+            tabIndex={addedCount ? 0 : undefined}
+            onClick={(event) => event.stopPropagation()}
+          >
+            쇼핑 리스트에 추가된 물품 <b>{addedCount}</b>개
+            {addedCount > 0 && (
+              <span className="memo-items-tooltip" role="tooltip">
+                <strong>이 메모에서 추가한 물품</strong>
+                {addedItems.map((item) => (
+                  <span key={item.id}>{item.name}</span>
+                ))}
+              </span>
+            )}
+          </span>
+        )}
+        {!analysis && (
+          <span className="memo-added-items is-placeholder" aria-hidden="true">
+            쇼핑 리스트에 추가된 물품 0개
+          </span>
+        )}
+        <div className="card-actions">
+          {analysis ? (
+            <>
+              <button
+                className="button primary small"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onOpenAnalysis();
+                }}
+              >
+                분석 결과 보기
+              </button>
+              <button
+                className="button ghost small"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onAnalyze();
+                }}
+                disabled={isLoading}
+              >
+                {isLoading ? "분석 중..." : "다시 분석"}
+              </button>
+            </>
+          ) : (
+            <button
+              className="button primary small"
+              onClick={(event) => {
+                event.stopPropagation();
+                onAnalyze();
+              }}
+              disabled={isLoading}
+            >
+              {isLoading ? "AI가 분석하고 있어요..." : "AI로 분석하기"}
+            </button>
+          )}
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function AnalysisItemCard({
+  item,
+  existingItem,
+  onAdd,
+  onViewExisting,
+  onDelete,
+  onUpdate,
+}) {
   const [editing, setEditing] = useState(false);
-  const isSuggested = item.sourceType === "suggested";
 
   if (editing) {
     return (
@@ -149,42 +351,149 @@ function SuggestionCard({ item, onAdd, onDelete, onUpdate }) {
   }
 
   return (
-    <article className="suggestion-card">
+    <article className={`suggestion-card source-${item.sourceType}`}>
       <div className="card-heading">
         <div>
-          <Badge tone={isSuggested ? "sage" : "apricot"}>{sourceLabels[item.sourceType]}</Badge>
+          <Badge tone={item.sourceType === "suggested" ? "sage" : "apricot"}>
+            {sourceLabels[item.sourceType]}
+          </Badge>
           <h4>{item.name}</h4>
         </div>
-        <Badge tone={item.priority === "높음" ? "red" : "neutral"}>{item.priority || "중간"}</Badge>
+        <Badge tone={item.priority === "높음" ? "red" : "neutral"}>
+          {item.priority || "중간"}
+        </Badge>
       </div>
       <p className="reason">{item.reason || "필요 여부를 확인해 주세요."}</p>
       <dl className="mini-details">
-        <div><dt>필요</dt><dd>{item.neededDateText || formatDate(item.neededDate)}</dd></div>
-        <div><dt>구매 마감</dt><dd>{item.purchaseDeadlineText || formatDate(item.purchaseDeadline)}</dd></div>
-        {item.note && <div><dt>비고</dt><dd>{item.note}</dd></div>}
+        <div>
+          <dt>관련 일정</dt>
+          <dd>{item.eventName || "-"}</dd>
+        </div>
+        <div>
+          <dt>필요 날짜</dt>
+          <dd>{item.neededDateText || formatDate(item.neededDate)}</dd>
+        </div>
+        <div>
+          <dt>구매 마감</dt>
+          <dd>
+            {item.purchaseDeadlineText || formatDate(item.purchaseDeadline)}
+          </dd>
+        </div>
+        <div>
+          <dt>비고</dt>
+          <dd>{item.note || "-"}</dd>
+        </div>
       </dl>
       <div className="card-actions">
-        <button className="button primary small" onClick={() => onAdd(item)}>구매 리스트에 추가</button>
-        <button className="button ghost small" onClick={() => setEditing(true)}>수정</button>
-        <button className="text-button danger" onClick={() => onDelete(item.id)}>삭제</button>
+        {existingItem ? (
+          <>
+            <button className="button disabled small" disabled>
+              이미 쇼핑 리스트에 있어요
+            </button>
+            <button className="text-button" onClick={onViewExisting}>
+              기존 항목 보기
+            </button>
+          </>
+        ) : (
+          <button className="button primary small" onClick={() => onAdd(item)}>
+            쇼핑 리스트에 추가
+          </button>
+        )}
+        <button className="button ghost small" onClick={() => setEditing(true)}>
+          수정
+        </button>
+        <button
+          className="text-button danger"
+          onClick={() => onDelete(item.id)}
+        >
+          삭제
+        </button>
       </div>
     </article>
   );
 }
 
-function EmptyState({ title, description, action }) {
+function AnalysisSourceSection({
+  title,
+  description,
+  tone,
+  items,
+  shoppingList,
+  onAdd,
+  onViewExisting,
+  onDelete,
+  onUpdate,
+}) {
+  if (!items.length) return null;
+
   return (
-    <div className="empty-state">
-      <div className="empty-mark">+</div>
-      <h3>{title}</h3>
-      <p>{description}</p>
-      {action}
+    <section className={`suggestion-source source-panel-${tone}`}>
+      <div className="suggestion-source-heading">
+        <div>
+          <h4>{title}</h4>
+          <p>{description}</p>
+        </div>
+        <b>{items.length}</b>
+      </div>
+      <div className="suggestion-grid">
+        {items.map((item) => {
+          const existingItem = shoppingList.find(
+            (saved) =>
+              normalize(saved.name) === normalize(item.name) &&
+              normalize(saved.eventName) === normalize(item.eventName),
+          );
+          return (
+            <AnalysisItemCard
+              item={item}
+              existingItem={existingItem}
+              key={item.id}
+              onAdd={onAdd}
+              onViewExisting={() => onViewExisting(existingItem)}
+              onDelete={onDelete}
+              onUpdate={onUpdate}
+            />
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function AddConfirmationModal({ itemName, onClose, onOpenShoppingList }) {
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <section
+        className="modal confirmation-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="add-confirmation-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="confirmation-mark">✓</div>
+        <p className="section-kicker">SHOPPING LIST</p>
+        <h2 id="add-confirmation-title">추가가 완료되었습니다.</h2>
+        <p>
+          쇼핑 리스트에서 <b>{itemName}</b> 항목을 확인할 수 있어요.
+        </p>
+        <div className="confirmation-actions">
+          <button className="button ghost" onClick={onClose}>
+            계속 보기
+          </button>
+          <button className="button primary" onClick={onOpenShoppingList}>
+            쇼핑 리스트 보기
+          </button>
+        </div>
+      </section>
     </div>
   );
 }
 
 function RecommendationModal({ item, onClose, onSelect }) {
-  const [state, setState] = useState({ loading: true, products: [], error: "" });
+  const [state, setState] = useState({
+    loading: true,
+    products: [],
+    error: "",
+  });
 
   useEffect(() => {
     let active = true;
@@ -195,11 +504,25 @@ function RecommendationModal({ item, onClose, onSelect }) {
     })
       .then(async (response) => {
         const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "상품 추천을 불러오지 못했습니다.");
+        if (!response.ok)
+          throw new Error(data.error || "상품 추천을 불러오지 못했습니다.");
         return data;
       })
-      .then((data) => active && setState({ loading: false, products: data.recommendations || [], error: "", demoMode: data.demoMode }))
-      .catch((error) => active && setState({ loading: false, products: [], error: error.message }));
+      .then(
+        (data) =>
+          active &&
+          setState({
+            loading: false,
+            products: data.recommendations || [],
+            error: "",
+            demoMode: data.demoMode,
+          }),
+      )
+      .catch(
+        (error) =>
+          active &&
+          setState({ loading: false, products: [], error: error.message }),
+      );
     return () => {
       active = false;
     };
@@ -207,33 +530,67 @@ function RecommendationModal({ item, onClose, onSelect }) {
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
-      <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
+      <section
+        className="modal"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
         <div className="modal-heading">
           <div>
             <p className="eyebrow">AI 상품 찾기</p>
             <h2>{item.name} 추천 결과</h2>
           </div>
-          <button className="icon-button" onClick={onClose} aria-label="닫기">×</button>
+          <button className="icon-button" onClick={onClose} aria-label="닫기">
+            ×
+          </button>
         </div>
-        <p className="modal-intro">일정과 마감일을 고려해 수집된 상품 중에서 골랐어요. 배송 정보는 확인된 내용만 표시합니다.</p>
-        {state.demoMode && <div className="notice">OpenAI API 키가 없어 수집 결과를 기준으로 정렬한 데모 추천입니다.</div>}
-        {state.loading && <div className="loading">상품 정보를 찾고 있어요<span>.</span><span>.</span><span>.</span></div>}
+        <p className="modal-intro">
+          일정과 마감일을 고려해 수집된 상품 중에서 골랐어요. 배송 정보는 확인된
+          내용만 표시합니다.
+        </p>
+        {state.demoMode && (
+          <div className="notice">
+            OpenAI API 키가 없어 수집 결과를 기준으로 정렬한 데모 추천입니다.
+          </div>
+        )}
+        {state.loading && (
+          <div className="loading">상품 정보를 찾고 있어요...</div>
+        )}
         {state.error && <div className="error-box">{state.error}</div>}
         <div className="product-list">
           {state.products.map((product, index) => (
             <article className="product-card" key={`${product.link}-${index}`}>
-              <div className="product-rank">{String(index + 1).padStart(2, "0")}</div>
+              <div className="product-rank">
+                {String(index + 1).padStart(2, "0")}
+              </div>
               <div className="product-body">
                 <h3>{product.productTitle}</h3>
                 <div className="product-meta">
                   <strong>{product.price || "가격 확인 필요"}</strong>
-                  <span>{product.deliveryInfo || "배송 정보: 확인할 수 없음"}</span>
+                  <span>
+                    {product.deliveryInfo || "배송 정보: 확인할 수 없음"}
+                  </span>
                 </div>
-                <p><b>추천 이유</b> {product.reason}</p>
-                <p className="caution"><b>확인할 점</b> {product.caution}</p>
+                <p>
+                  <b>추천 이유</b> {product.reason}
+                </p>
+                <p className="caution">
+                  <b>확인할 점</b> {product.caution}
+                </p>
                 <div className="card-actions">
-                  <a className="button ghost small" href={product.link} target="_blank" rel="noreferrer">상품 보기</a>
-                  <button className="button primary small" onClick={() => onSelect(product)}>이 상품 선택</button>
+                  <a
+                    className="button ghost small"
+                    href={product.link}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    상품 보기
+                  </a>
+                  <button
+                    className="button primary small"
+                    onClick={() => onSelect(product)}
+                  >
+                    이 상품 선택
+                  </button>
                 </div>
               </div>
             </article>
@@ -245,118 +602,230 @@ function RecommendationModal({ item, onClose, onSelect }) {
 }
 
 function App() {
-  const [activeTab, setActiveTab] = useState("memo");
-  const [memo, setMemo] = useStoredState("salddeut.memo", DEFAULT_MEMO);
-  const [suggestions, setSuggestions] = useStoredState("salddeut.suggestions", []);
-  const [purchaseList, setPurchaseList] = useStoredState("salddeut.purchaseList", []);
-  const [analysisMeta, setAnalysisMeta] = useStoredState("salddeut.analysisMeta", null);
-  const [analysisState, setAnalysisState] = useState({ loading: false, error: "" });
-  const [manualMode, setManualMode] = useState(false);
+  const { route, navigate } = useRouter();
+  const activeView = route.name;
+  const selectedMemoId = route.memoId || null;
+  const [memos, setMemos] = useStoredState("salddeut.memos", createLegacyMemos);
+  const [analysesByMemoId, setAnalysesByMemoId] = useStoredState(
+    "salddeut.analysesByMemoId",
+    createLegacyAnalyses,
+  );
+  const [shoppingList, setShoppingList] = useStoredState(
+    "salddeut.shoppingList",
+    createLegacyShoppingList,
+  );
+  const [newMemo, setNewMemo] = useState({ title: "", content: "" });
+  const [analysisState, setAnalysisState] = useState({
+    loadingMemoId: null,
+    error: "",
+  });
+  const [manualEventName, setManualEventName] = useState(null);
+  const [collapsedEvents, setCollapsedEvents] = useState({});
+  const [addedItemName, setAddedItemName] = useState(null);
   const [editingListItem, setEditingListItem] = useState(null);
   const [recommendationItem, setRecommendationItem] = useState(null);
   const [sortBy, setSortBy] = useState("priority");
 
-  const counts = {
-    suggestions: suggestions.length,
-    list: purchaseList.filter((item) => item.status !== "purchased").length,
-    today: purchaseList.filter((item) => item.status !== "purchased" && dateDiff(item.purchaseDeadline) <= 0).length,
-  };
+  const memoById = useMemo(
+    () => Object.fromEntries(memos.map((memo) => [memo.id, memo])),
+    [memos],
+  );
+  const selectedMemo = selectedMemoId ? memoById[selectedMemoId] : null;
+  const selectedAnalysis = selectedMemoId
+    ? analysesByMemoId[selectedMemoId]
+    : null;
+  const selectedAnalysisEventNames = selectedAnalysis
+    ? [
+        ...new Set([
+          ...(selectedAnalysis.eventNames || []),
+          ...(selectedAnalysis.items || []).map(
+            (item) => item.eventName || "기타 구매",
+          ),
+        ]),
+      ]
+    : [];
 
-  const sortedPurchaseList = useMemo(() => {
-    return [...purchaseList].sort((a, b) => {
+  const sortedShoppingList = useMemo(() => {
+    return [...shoppingList].sort((a, b) => {
       if (a.status === "purchased" && b.status !== "purchased") return 1;
       if (b.status === "purchased" && a.status !== "purchased") return -1;
-      if (sortBy === "deadline") return dateDiff(a.purchaseDeadline) - dateDiff(b.purchaseDeadline);
-      if (sortBy === "neededDate") return dateDiff(a.neededDate) - dateDiff(b.neededDate);
+      if (sortBy === "deadline")
+        return compareDate(a.purchaseDeadline, b.purchaseDeadline);
+      if (sortBy === "neededDate")
+        return compareDate(a.neededDate, b.neededDate);
       return (priorityRank[a.priority] ?? 1) - (priorityRank[b.priority] ?? 1);
     });
-  }, [purchaseList, sortBy]);
+  }, [shoppingList, sortBy]);
 
-  const todayGroups = useMemo(() => {
-    const open = purchaseList.filter((item) => item.status !== "purchased");
-    return [
-      {
-        title: "오늘 꼭 사야 해요",
-        description: "마감이 오늘이거나 이미 지난 항목이에요.",
-        items: open.filter((item) => dateDiff(item.purchaseDeadline) <= 0),
-      },
-      {
-        title: "곧 사야 해요",
-        description: "마감까지 3일 이내로 남았어요.",
-        items: open.filter((item) => dateDiff(item.purchaseDeadline) > 0 && dateDiff(item.purchaseDeadline) <= 3),
-      },
-      {
-        title: "아직 여유 있어요",
-        description: "미리 살펴보면 마음이 가벼워질 항목이에요.",
-        items: open.filter((item) => dateDiff(item.purchaseDeadline) > 3 || !item.purchaseDeadline),
-      },
-      {
-        title: "구매 완료",
-        description: "잘 챙겼어요. 완료한 기록은 여기 모아 둘게요.",
-        items: purchaseList.filter((item) => item.status === "purchased"),
-      },
-    ];
-  }, [purchaseList]);
+  function openHome() {
+    navigate("/");
+    setAddedItemName(null);
+  }
 
-  async function analyzeMemo() {
-    if (!memo.trim()) return;
-    setAnalysisState({ loading: true, error: "" });
+  function openInbox() {
+    navigate("/memos");
+    setAnalysisState((current) => ({ ...current, error: "" }));
+  }
+
+  function openShoppingList() {
+    navigate("/shopping-list");
+    setAddedItemName(null);
+  }
+
+  function openMemoDetail(memoId) {
+    navigate(`/memos/${encodeURIComponent(memoId)}`);
+  }
+
+  function createMemoFromDraft() {
+    const content = newMemo.content.trim();
+    if (!content) return null;
+    return {
+      id: uid("memo"),
+      title: newMemo.title.trim() || makeMemoTitle(content),
+      content,
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  function saveMemo() {
+    const memo = createMemoFromDraft();
+    if (!memo) return;
+    setMemos((current) => [memo, ...current]);
+    setNewMemo({ title: "", content: "" });
+  }
+
+  function saveAndAnalyzeMemo() {
+    const memo = createMemoFromDraft();
+    if (!memo) return;
+    setMemos((current) => [memo, ...current]);
+    setNewMemo({ title: "", content: "" });
+    analyzeMemo(memo);
+  }
+
+  async function analyzeMemo(memo) {
+    setAnalysisState({ loadingMemoId: memo.id, error: "" });
     try {
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ memo }),
+        body: JSON.stringify({ memo: memo.content }),
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "메모를 분석하지 못했습니다.");
-      setSuggestions(flattenEvents(data.events));
-      setAnalysisMeta({ demoMode: data.demoMode, createdAt: new Date().toISOString() });
-      setActiveTab("suggestions");
+      if (!response.ok)
+        throw new Error(data.error || "메모를 분석하지 못했습니다.");
+
+      const analysis = {
+        memoId: memo.id,
+        eventNames: [
+          ...new Set(
+            data.events.map((event) => event.eventName || "기타 구매"),
+          ),
+        ],
+        items: flattenEvents(data.events),
+        analyzedAt: new Date().toISOString(),
+        demoMode: Boolean(data.demoMode),
+      };
+      setAnalysesByMemoId((current) => ({ ...current, [memo.id]: analysis }));
+      navigate(`/memos/${encodeURIComponent(memo.id)}/analysis`);
     } catch (error) {
-      setAnalysisState({ loading: false, error: error.message });
+      setAnalysisState({ loadingMemoId: null, error: error.message });
       return;
     }
-    setAnalysisState({ loading: false, error: "" });
+    setAnalysisState({ loadingMemoId: null, error: "" });
   }
 
-  function addToPurchaseList(item) {
-    if (purchaseList.some((saved) => saved.suggestionId === item.id)) return;
-    setPurchaseList((current) => [
+  function openAnalysis(memoId) {
+    setManualEventName(null);
+    navigate(`/memos/${encodeURIComponent(memoId)}/analysis`);
+  }
+
+  function updateAnalysisItems(updater) {
+    if (!selectedMemoId) return;
+    setAnalysesByMemoId((current) => ({
+      ...current,
+      [selectedMemoId]: {
+        ...current[selectedMemoId],
+        items: updater(current[selectedMemoId]?.items || []),
+      },
+    }));
+  }
+
+  function addManualAnalysisItem(item) {
+    if (!selectedMemoId) return;
+    const manualItem = {
+      ...item,
+      id: uid("manual"),
+      eventName: item.eventName || "기타 구매",
+      sourceType: "manual",
+      reason: item.reason || "직접 추가한 물품",
+    };
+    setAnalysesByMemoId((current) => {
+      const analysis = current[selectedMemoId];
+      return {
+        ...current,
+        [selectedMemoId]: {
+          ...analysis,
+          eventNames: [
+            ...new Set([...(analysis.eventNames || []), manualItem.eventName]),
+          ],
+          items: [...(analysis.items || []), manualItem],
+        },
+      };
+    });
+    setManualEventName(null);
+  }
+
+  function addToShoppingList(item) {
+    if (!selectedMemoId) return;
+    const duplicate = shoppingList.some(
+      (saved) =>
+        normalize(saved.name) === normalize(item.name) &&
+        normalize(saved.eventName) === normalize(item.eventName),
+    );
+    if (duplicate) return;
+
+    setShoppingList((current) => [
       ...current,
       {
         ...item,
-        id: uid("buy"),
-        suggestionId: item.id,
+        id: uid("shopping"),
+        analysisItemId: item.id,
+        sourceMemoId: selectedMemoId,
         status: "pending",
         selectedProduct: null,
         purchasedAt: null,
       },
     ]);
+    setAddedItemName(item.name);
   }
 
-  function addManualItem(item) {
-    const suggestion = { ...item, id: uid("manual"), sourceType: "manual", reason: item.reason || "직접 추가한 물품" };
-    setSuggestions((current) => [...current, suggestion]);
-    setManualMode(false);
+  function toggleEvent(eventName) {
+    setCollapsedEvents((current) => ({
+      ...current,
+      [eventName]: !current[eventName],
+    }));
   }
 
   function updateListItem(updated) {
-    setPurchaseList((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+    setShoppingList((current) =>
+      current.map((item) => (item.id === updated.id ? updated : item)),
+    );
     setEditingListItem(null);
   }
 
   function removeListItem(id) {
-    setPurchaseList((current) => current.filter((item) => item.id !== id));
+    setShoppingList((current) => current.filter((item) => item.id !== id));
   }
 
   function togglePurchased(id) {
-    setPurchaseList((current) =>
+    setShoppingList((current) =>
       current.map((item) =>
         item.id === id
           ? {
               ...item,
               status: item.status === "purchased" ? "pending" : "purchased",
-              purchasedAt: item.status === "purchased" ? null : new Date().toISOString(),
+              purchasedAt:
+                item.status === "purchased" ? null : new Date().toISOString(),
             }
           : item,
       ),
@@ -366,160 +835,575 @@ function App() {
   return (
     <div className="app-shell">
       <header className="site-header">
-        <button className="brand" onClick={() => setActiveTab("memo")}>
-          <span className="brand-mark">ㅅ</span>
-          <span><b>살뜰</b><small>AI shopping helper</small></span>
-        </button>
-        <div className="header-note"><span></span>오늘의 가족 장보기를 가볍게</div>
+        <div className="header-inner">
+          <button className="brand" onClick={openHome}>
+            <span className="brand-copy">
+              <b>살뜰</b>
+              <small>우리 가족 생활용품 비서</small>
+            </span>
+          </button>
+          <nav className="main-nav" aria-label="주요 화면">
+            <button
+              className={
+                activeView === "inbox" ||
+                activeView === "memoDetail" ||
+                activeView === "analysis"
+                  ? "active"
+                  : ""
+              }
+              onClick={openInbox}
+            >
+              <span>메모함</span>
+              <b>{memos.length}</b>
+            </button>
+            <button
+              className={activeView === "shopping" ? "active" : ""}
+              onClick={openShoppingList}
+            >
+              <span>쇼핑 리스트</span>
+              <b>{shoppingList.length}</b>
+            </button>
+          </nav>
+        </div>
       </header>
 
       <main>
-        <section className="hero">
-          <p className="eyebrow">HOUSEHOLD SHOPPING AGENT</p>
-          <h1>기억할 장보기는<br /><em>살뜰</em>하게 맡겨 주세요.</h1>
-          <p>뒤섞인 가족 메모를 적으면, 필요한 물품과 살 때를 AI가 먼저 정리해 드려요.</p>
-        </section>
-
-        <nav className="tabs" aria-label="주요 화면">
-          {tabs.map(([id, label, number]) => (
-            <button className={`tab ${activeTab === id ? "active" : ""}`} onClick={() => setActiveTab(id)} key={id}>
-              <span>{number}</span>
-              {label}
-              {counts[id] > 0 && <b>{counts[id]}</b>}
-            </button>
-          ))}
-        </nav>
-
-        {activeTab === "memo" && (
-          <section className="panel memo-layout">
-            <div>
-              <p className="section-kicker">STEP 01</p>
-              <h2>생각나는 대로<br />편하게 적어 보세요.</h2>
-              <p className="section-copy">일정, 준비물, 미뤄 둔 쇼핑을 한꺼번에 적어도 괜찮아요. 필요한 장보기만 골라 정리할게요.</p>
-              <div className="memo-tip"><b>이렇게 적어 보세요</b><br />“다음 주 소풍 준비물이랑 엄마 생신 선물 알아봐야 해.”</div>
-            </div>
-            <div className="memo-card">
-              <div className="memo-label"><span></span>우리 집 메모</div>
-              <textarea value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="가족 일정과 필요한 물품을 자유롭게 적어 주세요." />
-              {analysisState.error && <div className="error-box">{analysisState.error}</div>}
-              <button className="button primary wide-button" onClick={analyzeMemo} disabled={analysisState.loading || !memo.trim()}>
-                {analysisState.loading ? "AI가 장보기를 정리하고 있어요..." : "AI가 구매 리스트 만들기"}
-                {!analysisState.loading && <span>→</span>}
+        {activeView === "home" && (
+          <section className="hero onboarding-hero">
+            <div className="onboarding-content">
+              <p className="eyebrow">FAMILY PURCHASE AGENT</p>
+              <h1>
+                놓치기 쉬운 살 것들을
+                <br />
+                AI가 먼저 챙겨드려요.
+              </h1>
+              <p>
+                우리 가족의 생활용품과 관련된 메모를 적으면, 필요한 물건과 사야
+                할 때를 AI가 정리해드려요.
+              </p>
+              <button className="button primary onboarding-cta" onClick={openInbox}>
+                지금 시작하기 <span>→</span>
               </button>
+            </div>
+            <div className="onboarding-points" aria-label="주요 기능">
+              <span>여러 메모를 한곳에</span>
+              <span>AI가 준비물을 정리</span>
+              <span>필요할 때 상품 추천</span>
             </div>
           </section>
         )}
 
-        {activeTab === "suggestions" && (
-          <section className="panel">
+        {activeView === "inbox" && (
+          <section className="panel inbox-panel">
             <div className="section-heading">
               <div>
-                <p className="section-kicker">STEP 02</p>
-                <h2>AI가 먼저 챙겨 봤어요.</h2>
-                <p>필요한 항목만 골라 구매 리스트에 담아 주세요. 집에 있는지는 사용자가 판단할 수 있도록 직접 언급과 추가 추천을 나눴어요.</p>
+                <p className="section-kicker">MEMO INBOX</p>
+                <h2>메모함</h2>
+                <p>
+                  가족 일정에서 생기는 준비물을 메모로 남겨 두세요. 필요한
+                  메모만 골라 AI로 분석할 수 있어요.
+                </p>
               </div>
-              <button className="button ghost" onClick={() => setManualMode(true)}>+ 빠진 물품 직접 추가</button>
             </div>
-            {analysisMeta?.demoMode && <div className="notice">OpenAI API 키가 없어 예시 분석을 보여 드리고 있어요. 키를 연결하면 작성한 메모를 AI가 직접 분석합니다.</div>}
-            {manualMode && (
-              <ItemEditor
-                item={{ name: "", eventName: "", neededDate: null, purchaseDeadline: null, priority: "중간", note: "" }}
-                onSave={addManualItem}
-                onCancel={() => setManualMode(false)}
+            <section className="new-memo-card">
+              <div className="new-memo-heading">
+                <div>
+                  <p className="section-kicker">NEW MEMO</p>
+                  <h3>새 메모 작성</h3>
+                </div>
+                <span>저장 후 원하는 시점에 AI로 분석해요.</span>
+              </div>
+              <input
+                className="memo-title-input"
+                value={newMemo.title}
+                onChange={(event) =>
+                  setNewMemo((current) => ({
+                    ...current,
+                    title: event.target.value,
+                  }))
+                }
+                placeholder="메모 제목 (선택)"
               />
+              <textarea
+                value={newMemo.content}
+                onChange={(event) =>
+                  setNewMemo((current) => ({
+                    ...current,
+                    content: event.target.value,
+                  }))
+                }
+                placeholder="예: 다음 주 금요일 지우 유치원 소풍. 도시락통 새로 사야 하고 물통도 확인해야 함. 다음 달 초에는 엄마 생신 선물도 봐야 함."
+              />
+              <div className="new-memo-actions">
+                <button
+                  className="button ghost"
+                  onClick={saveMemo}
+                  disabled={!newMemo.content.trim()}
+                >
+                  메모 저장
+                </button>
+                <button
+                  className="button primary"
+                  onClick={saveAndAnalyzeMemo}
+                  disabled={
+                    !newMemo.content.trim() ||
+                    Boolean(analysisState.loadingMemoId)
+                  }
+                >
+                  {analysisState.loadingMemoId
+                    ? "AI가 분석하고 있어요..."
+                    : "AI 분석하기"}
+                </button>
+              </div>
+            </section>
+            {analysisState.error && (
+              <div className="error-box">{analysisState.error}</div>
             )}
-            {suggestions.length === 0 ? (
+            {memos.length === 0 ? (
               <EmptyState
-                title="아직 정리한 메모가 없어요."
-                description="메모를 남기면 일정별 구매 후보를 정리해 드릴게요."
-                action={<button className="button primary" onClick={() => setActiveTab("memo")}>메모 작성하기</button>}
+                title="아직 저장한 메모가 없어요."
+                description="위에서 첫 메모를 작성해 보세요. 저장만으로는 AI 분석이 실행되지 않아요."
               />
             ) : (
-              <div className="suggestion-groups">
-                {[...new Set(suggestions.map((item) => item.eventName || "기타 장보기"))].map((eventName) => (
-                  <section className="event-group" key={eventName}>
-                    <div className="event-title">
-                      <span>일정</span>
-                      <h3>{eventName}</h3>
-                      <b>{suggestions.filter((item) => item.eventName === eventName).length}</b>
-                    </div>
-                    <div className="suggestion-grid">
-                      {suggestions.filter((item) => item.eventName === eventName).map((item) => (
-                        <SuggestionCard
-                          item={item}
-                          key={item.id}
-                          onAdd={addToPurchaseList}
-                          onDelete={(id) => setSuggestions((current) => current.filter((saved) => saved.id !== id))}
-                          onUpdate={(updated) => setSuggestions((current) => current.map((saved) => (saved.id === updated.id ? updated : saved)))}
-                        />
-                      ))}
-                    </div>
-                  </section>
+              <div className="memo-card-grid">
+                {memos.map((memo) => (
+                  <MemoCard
+                    memo={memo}
+                    analysis={analysesByMemoId[memo.id]}
+                    addedItems={shoppingList.filter(
+                      (item) => item.sourceMemoId === memo.id,
+                    )}
+                    isLoading={analysisState.loadingMemoId === memo.id}
+                    key={memo.id}
+                    onOpenDetail={() => openMemoDetail(memo.id)}
+                    onAnalyze={() => analyzeMemo(memo)}
+                    onOpenAnalysis={() => openAnalysis(memo.id)}
+                  />
                 ))}
               </div>
             )}
           </section>
         )}
 
-        {activeTab === "list" && (
+        {activeView === "memoDetail" && selectedMemo && (
+          <section className="panel memo-detail-panel">
+            <div className="workspace-toolbar">
+              <button className="back-button" onClick={openInbox}>
+                ← 메모함으로 돌아가기
+              </button>
+              <button className="button ghost" onClick={openShoppingList}>
+                쇼핑 리스트 보기
+              </button>
+            </div>
+            <article className="memo-detail-card">
+              <div className="memo-detail-heading">
+                <div>
+                  <p className="section-kicker">MEMO DETAIL</p>
+                  <h2>{selectedMemo.title}</h2>
+                </div>
+                <div className="memo-detail-meta">
+                  <Badge tone={selectedAnalysis ? "sage" : "apricot"}>
+                    {selectedAnalysis ? "분석 완료" : "분석 전"}
+                  </Badge>
+                  <time>{formatCreatedAt(selectedMemo.createdAt)}</time>
+                </div>
+              </div>
+              <div className="memo-detail-content">{selectedMemo.content}</div>
+              <div className="memo-detail-actions">
+                {selectedAnalysis ? (
+                  <>
+                    <button
+                      className="button primary"
+                      onClick={() => openAnalysis(selectedMemo.id)}
+                    >
+                      분석 결과 보기
+                    </button>
+                    <button
+                      className="button ghost"
+                      onClick={() => analyzeMemo(selectedMemo)}
+                      disabled={analysisState.loadingMemoId === selectedMemo.id}
+                    >
+                      {analysisState.loadingMemoId === selectedMemo.id
+                        ? "분석 중..."
+                        : "다시 분석"}
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    className="button primary"
+                    onClick={() => analyzeMemo(selectedMemo)}
+                    disabled={analysisState.loadingMemoId === selectedMemo.id}
+                  >
+                    {analysisState.loadingMemoId === selectedMemo.id
+                      ? "AI가 분석하고 있어요..."
+                      : "AI로 분석하기"}
+                  </button>
+                )}
+              </div>
+            </article>
+            {analysisState.error && (
+              <div className="error-box">{analysisState.error}</div>
+            )}
+            {selectedAnalysis && (
+              <section className="memo-detail-items">
+                <div className="memo-detail-section-heading">
+                  <div>
+                    <p className="section-kicker">SHOPPING LIST ITEMS</p>
+                    <h3>이 메모에서 추가한 물품</h3>
+                  </div>
+                  <b>
+                    {
+                      shoppingList.filter(
+                        (item) => item.sourceMemoId === selectedMemo.id,
+                      ).length
+                    }
+                  </b>
+                </div>
+                {shoppingList.filter(
+                  (item) => item.sourceMemoId === selectedMemo.id,
+                ).length > 0 ? (
+                  <div className="memo-detail-item-list">
+                    {shoppingList
+                      .filter((item) => item.sourceMemoId === selectedMemo.id)
+                      .map((item) => (
+                        <div className="memo-detail-item" key={item.id}>
+                          <span>
+                            <strong>{item.name}</strong>
+                            <small>{item.eventName || "관련 일정 없음"}</small>
+                          </span>
+                          <Badge
+                            tone={
+                              item.status === "purchased" ? "sage" : "neutral"
+                            }
+                          >
+                            {item.status === "purchased" ? "구매 완료" : "구매 전"}
+                          </Badge>
+                        </div>
+                      ))}
+                  </div>
+                ) : (
+                  <p className="memo-detail-empty">
+                    아직 이 메모에서 쇼핑 리스트로 추가한 물품이 없어요.
+                  </p>
+                )}
+              </section>
+            )}
+          </section>
+        )}
+
+        {activeView === "memoDetail" && !selectedMemo && (
           <section className="panel">
+            <EmptyState
+              title="메모를 찾을 수 없어요."
+              description="메모함에서 확인할 메모를 다시 선택해 주세요."
+              action={
+                <button className="button primary" onClick={openInbox}>
+                  메모함으로 이동
+                </button>
+              }
+            />
+          </section>
+        )}
+
+        {activeView === "analysis" && selectedMemo && selectedAnalysis && (
+          <section className="panel analysis-panel">
+            <div className="workspace-toolbar">
+              <button className="back-button" onClick={openInbox}>
+                ← 메모함으로 돌아가기
+              </button>
+              <button className="button primary" onClick={openShoppingList}>
+                쇼핑 리스트 보기
+              </button>
+            </div>
+            <section className="analysis-summary">
+              <div>
+                <p className="section-kicker">AI ANALYSIS WORKSPACE</p>
+                <h2>{selectedMemo.title}</h2>
+                <p>{selectedMemo.content}</p>
+              </div>
+              <div className="analysis-meta">
+                <Badge tone="sage">분석 완료</Badge>
+                <small>{formatCreatedAt(selectedAnalysis.analyzedAt)}</small>
+              </div>
+            </section>
+            {selectedAnalysis.demoMode && (
+              <div className="notice">
+                OpenAI API 키가 없어 예시 분석을 보여 드리고 있어요. 키를
+                연결하면 작성한 메모를 AI가 직접 분석합니다.
+              </div>
+            )}
+            <div className="suggestion-groups">
+              {selectedAnalysisEventNames.map((eventName) => {
+                const eventItems = selectedAnalysis.items.filter(
+                  (item) => item.eventName === eventName,
+                );
+                return (
+                  <section className="event-group" key={eventName}>
+                    <button
+                      className="event-title"
+                      onClick={() => toggleEvent(eventName)}
+                      aria-expanded={!collapsedEvents[eventName]}
+                    >
+                      <span>일정</span>
+                      <h3>{eventName}</h3>
+                      <b>{eventItems.length}</b>
+                      <i
+                        className={`event-chevron ${
+                          collapsedEvents[eventName] ? "collapsed" : ""
+                        }`}
+                      >
+                        ⌃
+                      </i>
+                    </button>
+                    {!collapsedEvents[eventName] && (
+                      <div className="event-content">
+                        <AnalysisSourceSection
+                          title="사용자 언급 물품"
+                          description="메모에서 직접 찾은 물품이에요."
+                          tone="mentioned"
+                          items={eventItems.filter(
+                            (item) => item.sourceType === "mentioned",
+                          )}
+                          shoppingList={shoppingList}
+                          onAdd={addToShoppingList}
+                          onViewExisting={openShoppingList}
+                          onDelete={(id) =>
+                            updateAnalysisItems((items) =>
+                              items.filter((item) => item.id !== id),
+                            )
+                          }
+                          onUpdate={(updated) =>
+                            updateAnalysisItems((items) =>
+                              items.map((item) =>
+                                item.id === updated.id ? updated : item,
+                              ),
+                            )
+                          }
+                        />
+                        <AnalysisSourceSection
+                          title="AI 추가 추천 물품"
+                          description="일정 맥락을 바탕으로 함께 챙겨 본 물품이에요."
+                          tone="suggested"
+                          items={eventItems.filter(
+                            (item) => item.sourceType === "suggested",
+                          )}
+                          shoppingList={shoppingList}
+                          onAdd={addToShoppingList}
+                          onViewExisting={openShoppingList}
+                          onDelete={(id) =>
+                            updateAnalysisItems((items) =>
+                              items.filter((item) => item.id !== id),
+                            )
+                          }
+                          onUpdate={(updated) =>
+                            updateAnalysisItems((items) =>
+                              items.map((item) =>
+                                item.id === updated.id ? updated : item,
+                              ),
+                            )
+                          }
+                        />
+                        <AnalysisSourceSection
+                          title="직접 추가한 물품"
+                          description="분석 결과를 보고 직접 보완한 물품이에요."
+                          tone="manual"
+                          items={eventItems.filter(
+                            (item) => item.sourceType === "manual",
+                          )}
+                          shoppingList={shoppingList}
+                          onAdd={addToShoppingList}
+                          onViewExisting={openShoppingList}
+                          onDelete={(id) =>
+                            updateAnalysisItems((items) =>
+                              items.filter((item) => item.id !== id),
+                            )
+                          }
+                          onUpdate={(updated) =>
+                            updateAnalysisItems((items) =>
+                              items.map((item) =>
+                                item.id === updated.id ? updated : item,
+                              ),
+                            )
+                          }
+                        />
+                        {manualEventName === eventName ? (
+                          <ItemEditor
+                            item={{
+                              name: "",
+                              eventName,
+                              neededDate: null,
+                              purchaseDeadline: null,
+                              priority: "중간",
+                              note: "",
+                            }}
+                            onSave={addManualAnalysisItem}
+                            onCancel={() => setManualEventName(null)}
+                          />
+                        ) : (
+                          <button
+                            className="manual-add-card"
+                            onClick={() => setManualEventName(eventName)}
+                          >
+                            <span>+</span>
+                            <strong>직접 추가</strong>
+                            <small>
+                              이 일정에서 빠진 물품을 추가해 주세요.
+                            </small>
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </section>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {activeView === "analysis" && (!selectedMemo || !selectedAnalysis) && (
+          <section className="panel">
+            <EmptyState
+              title="분석 결과를 찾을 수 없어요."
+              description="메모함에서 분석할 메모를 선택해 주세요."
+              action={
+                <button className="button primary" onClick={openInbox}>
+                  메모함으로 이동
+                </button>
+              }
+            />
+          </section>
+        )}
+
+        {activeView === "shopping" && (
+          <section className="panel shopping-panel">
             <div className="section-heading list-heading">
               <div>
-                <p className="section-kicker">STEP 03</p>
-                <h2>구매 리스트</h2>
-                <p>확정한 장보기만 모았어요. 상품이 정해지지 않은 항목은 AI에게 찾아 달라고 해 보세요.</p>
+                <p className="section-kicker">PERMANENT SHOPPING LIST</p>
+                <h2>쇼핑 리스트</h2>
+                <p>
+                  여러 메모에서 확정한 물품을 한곳에 모았어요. 상품 찾기와 구매
+                  완료 처리도 여기에서 진행해 주세요.
+                </p>
               </div>
               <label className="sort-control">
                 <span>정렬</span>
-                <select value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+                <select
+                  value={sortBy}
+                  onChange={(event) => setSortBy(event.target.value)}
+                >
                   <option value="priority">우선순위순</option>
                   <option value="deadline">구매 마감일순</option>
                   <option value="neededDate">필요 날짜순</option>
                 </select>
               </label>
             </div>
-            {purchaseList.length === 0 ? (
+            {shoppingList.length === 0 ? (
               <EmptyState
-                title="구매 리스트가 비어 있어요."
-                description="AI 제안에서 필요한 물품을 골라 담아 주세요."
-                action={<button className="button primary" onClick={() => setActiveTab("suggestions")}>AI 제안 보러 가기</button>}
+                title="쇼핑 리스트가 비어 있어요."
+                description="메모함에서 필요한 메모를 분석하고 물품을 추가해 주세요."
+                action={
+                  <button className="button primary" onClick={openInbox}>
+                    메모함 보러 가기
+                  </button>
+                }
               />
             ) : (
               <div className="table-wrap">
                 <table>
                   <thead>
                     <tr>
-                      <th>물품</th><th>관련 일정</th><th>필요 날짜</th><th>구매 마감일</th><th>우선순위</th><th>비고</th><th>구매할 상품</th><th>상태</th><th></th>
+                      <th>물품</th>
+                      <th>관련 일정</th>
+                      <th>출처 메모</th>
+                      <th>필요 날짜</th>
+                      <th>구매 마감일</th>
+                      <th>우선순위</th>
+                      <th>비고</th>
+                      <th>구매할 상품</th>
+                      <th>상태</th>
+                      <th></th>
                     </tr>
                   </thead>
                   <tbody>
-                    {sortedPurchaseList.map((item) => (
-                      <tr key={item.id} className={item.status === "purchased" ? "completed-row" : ""}>
-                        <td><b>{item.name}</b><small>{sourceLabels[item.sourceType]}</small></td>
+                    {sortedShoppingList.map((item) => (
+                      <tr
+                        key={item.id}
+                        className={
+                          item.status === "purchased" ? "completed-row" : ""
+                        }
+                      >
+                        <td>
+                          <b>{item.name}</b>
+                          <small>{sourceLabels[item.sourceType]}</small>
+                        </td>
                         <td>{item.eventName || "-"}</td>
+                        <td className="source-memo-cell">
+                          {memoById[item.sourceMemoId]?.title || "이전 메모"}
+                        </td>
                         <td>{formatDate(item.neededDate)}</td>
                         <td>{formatDate(item.purchaseDeadline)}</td>
-                        <td><Badge tone={item.priority === "높음" ? "red" : "neutral"}>{item.priority || "중간"}</Badge></td>
+                        <td>
+                          <Badge
+                            tone={item.priority === "높음" ? "red" : "neutral"}
+                          >
+                            {item.priority || "중간"}
+                          </Badge>
+                        </td>
                         <td>{item.note || "-"}</td>
                         <td className="product-cell">
                           {item.selectedProduct ? (
                             <>
-                              <a href={item.selectedProduct.link} target="_blank" rel="noreferrer">{item.selectedProduct.productTitle}</a>
-                              <button className="text-button" onClick={() => setRecommendationItem(item)}>다시 찾기</button>
+                              <b>{item.selectedProduct.productTitle}</b>
+                              <a
+                                href={item.selectedProduct.link}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                링크 열기
+                              </a>
+                              <button
+                                className="text-button"
+                                onClick={() => setRecommendationItem(item)}
+                              >
+                                변경
+                              </button>
                             </>
                           ) : (
-                            <button className="button mini" onClick={() => setRecommendationItem(item)}>AI로 상품 찾기</button>
+                            <button
+                              className="button mini"
+                              onClick={() => setRecommendationItem(item)}
+                            >
+                              AI로 상품 찾기
+                            </button>
                           )}
                         </td>
                         <td>
-                          <button className={`status-button ${item.status}`} onClick={() => togglePurchased(item.id)}>
-                            {item.status === "purchased" ? "구매 완료" : "구매 전"}
+                          <button
+                            className={`status-button ${item.status}`}
+                            onClick={() => togglePurchased(item.id)}
+                          >
+                            {item.status === "purchased"
+                              ? "구매 완료"
+                              : "구매 전"}
                           </button>
+                          {item.purchasedAt && (
+                            <small>{formatCreatedAt(item.purchasedAt)}</small>
+                          )}
                         </td>
                         <td>
                           <div className="row-actions">
-                            <button className="text-button" onClick={() => setEditingListItem(item)}>수정</button>
-                            <button className="text-button danger" onClick={() => removeListItem(item.id)}>삭제</button>
+                            <button
+                              className="text-button"
+                              onClick={() => setEditingListItem(item)}
+                            >
+                              수정
+                            </button>
+                            <button
+                              className="text-button danger"
+                              onClick={() => removeListItem(item.id)}
+                            >
+                              삭제
+                            </button>
                           </div>
                         </td>
                       </tr>
@@ -531,56 +1415,55 @@ function App() {
           </section>
         )}
 
-        {activeTab === "today" && (
+        {activeView === "notFound" && (
           <section className="panel">
-            <div className="section-heading">
-              <div>
-                <p className="section-kicker">TODAY</p>
-                <h2>오늘의 구매</h2>
-                <p>언제 살지 고민하지 않도록 마감일과 우선순위에 따라 지금 볼 항목부터 모았어요.</p>
-              </div>
-              <div className="today-date">{new Intl.DateTimeFormat("ko-KR", { year: "numeric", month: "long", day: "numeric" }).format(new Date())}</div>
-            </div>
-            <div className="today-grid">
-              {todayGroups.map((group, index) => (
-                <section className={`today-group group-${index}`} key={group.title}>
-                  <div className="today-group-title">
-                    <div>
-                      <span>{String(index + 1).padStart(2, "0")}</span>
-                      <h3>{group.title}</h3>
-                    </div>
-                    <b>{group.items.length}</b>
-                  </div>
-                  <p>{group.description}</p>
-                  {group.items.length === 0 ? (
-                    <div className="group-empty">해당하는 항목이 없어요.</div>
-                  ) : group.items.map((item) => (
-                    <article className="today-item" key={item.id}>
-                      <div>
-                        <Badge tone={item.priority === "높음" ? "red" : "neutral"}>{item.priority || "중간"}</Badge>
-                        <h4>{item.name}</h4>
-                        <small>{item.eventName}</small>
-                      </div>
-                      <p><b>이유</b> {item.status === "purchased" ? `${formatDate(item.purchasedAt?.slice(0, 10))}에 구매를 마쳤어요.` : buildTodayReason(item)}</p>
-                      {item.status !== "purchased" && (
-                        <button className="text-button" onClick={() => togglePurchased(item.id)}>구매 완료로 표시 →</button>
-                      )}
-                    </article>
-                  ))}
-                </section>
-              ))}
-            </div>
+            <EmptyState
+              title="페이지를 찾을 수 없어요."
+              description="주소를 다시 확인하거나 홈으로 돌아가 주세요."
+              action={
+                <button className="button primary" onClick={openHome}>
+                  홈으로 이동
+                </button>
+              }
+            />
           </section>
         )}
       </main>
 
-      <footer>살뜰 <span>·</span> 가족의 장보기를 기억 대신 실행으로</footer>
+      <footer>
+        살뜰 <span>·</span> 가족의 살 것을 기억 대신 실행으로
+      </footer>
 
+      {addedItemName && (
+        <AddConfirmationModal
+          itemName={addedItemName}
+          onClose={() => setAddedItemName(null)}
+          onOpenShoppingList={openShoppingList}
+        />
+      )}
       {editingListItem && (
-        <div className="modal-backdrop" onMouseDown={() => setEditingListItem(null)}>
-          <section className="modal edit-modal" onMouseDown={(event) => event.stopPropagation()}>
-            <div className="modal-heading"><h2>구매 항목 수정</h2><button className="icon-button" onClick={() => setEditingListItem(null)}>×</button></div>
-            <ItemEditor item={editingListItem} onSave={updateListItem} onCancel={() => setEditingListItem(null)} compact />
+        <div
+          className="modal-backdrop"
+          onMouseDown={() => setEditingListItem(null)}
+        >
+          <section
+            className="modal edit-modal"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="modal-heading">
+              <h2>쇼핑 리스트 항목 수정</h2>
+              <button
+                className="icon-button"
+                onClick={() => setEditingListItem(null)}
+              >
+                ×
+              </button>
+            </div>
+            <ItemEditor
+              item={editingListItem}
+              onSave={updateListItem}
+              onCancel={() => setEditingListItem(null)}
+            />
           </section>
         </div>
       )}
@@ -589,7 +1472,13 @@ function App() {
           item={recommendationItem}
           onClose={() => setRecommendationItem(null)}
           onSelect={(product) => {
-            setPurchaseList((current) => current.map((item) => (item.id === recommendationItem.id ? { ...item, selectedProduct: product } : item)));
+            setShoppingList((current) =>
+              current.map((item) =>
+                item.id === recommendationItem.id
+                  ? { ...item, selectedProduct: product }
+                  : item,
+              ),
+            );
             setRecommendationItem(null);
           }}
         />
@@ -598,13 +1487,11 @@ function App() {
   );
 }
 
-function buildTodayReason(item) {
-  const diff = dateDiff(item.purchaseDeadline);
-  if (!item.purchaseDeadline) return "구매 마감일을 확인하면 더 알맞은 시점에 알려 드릴 수 있어요.";
-  if (diff < 0) return `구매 마감일이 ${Math.abs(diff)}일 지났어요. 일정에 필요한 물품인지 먼저 확인해 주세요.`;
-  if (diff === 0) return "구매 마감일이 오늘이에요. 배송과 준비 시간을 고려해 오늘 확인하는 것이 좋아요.";
-  if (diff <= 3) return `구매 마감까지 ${diff}일 남았어요. 배송 시간을 고려해 미리 골라 두는 것이 좋아요.`;
-  return `구매 마감까지 ${diff}일 남았어요. 서두르지 않아도 되지만 여유 있을 때 살펴보세요.`;
+function compareDate(left, right) {
+  if (!left && !right) return 0;
+  if (!left) return 1;
+  if (!right) return -1;
+  return new Date(`${left}T00:00:00`) - new Date(`${right}T00:00:00`);
 }
 
 export default App;

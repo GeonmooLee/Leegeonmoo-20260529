@@ -37,7 +37,7 @@ app.post("/api/recommend", async (request, response) => {
 
   try {
     const crawledProducts = await crawlNaverShopping(item.name).catch((error) => {
-      console.warn("Shopping crawl unavailable, using search fallback:", error.message);
+      console.warn("Product search crawl unavailable, using search fallback:", error.message);
       return [];
     });
     const sourceProducts = crawledProducts.length ? crawledProducts : [createSearchFallback(item.name)];
@@ -93,7 +93,7 @@ async function analyzeMemoWithOpenAI(memo) {
 
   const result = await callOpenAI({
     instructions: [
-      "You are a Korean household shopping execution assistant.",
+      "You are a Korean family purchase execution assistant.",
       `Today's actual date is ${today}. Interpret relative dates using this date.`,
       "Extract family events and purchase candidates from the user's messy Korean memo.",
       "Separate products explicitly mentioned by the user into mentionedItems and context-based extra recommendations into suggestedItems.",
@@ -101,7 +101,7 @@ async function analyzeMemoWithOpenAI(memo) {
       "Write concise, warm Korean UI copy. Suggested items must have a concrete reason.",
     ].join("\n"),
     input: memo,
-    schemaName: "shopping_memo_analysis",
+    schemaName: "family_purchase_memo_analysis",
     schema,
   });
   return result.events;
@@ -135,7 +135,7 @@ async function recommendProductsWithOpenAI(item, crawledProducts) {
 
   return (await callOpenAI({
     instructions: [
-      "You recommend up to 3 Korean shopping candidates for a household purchase task.",
+      "You recommend up to 3 Korean product candidates for a family purchase task.",
       "Use only products from the crawledProducts JSON. Copy each chosen product title, link, price, and deliveryInfo exactly.",
       "Do not invent delivery dates or availability. If unavailable, keep the provided fallback delivery text.",
       "Do not rank only by popularity. Consider event, needed date, purchase deadline, priority, notes, and whether delivery data exists.",
@@ -210,7 +210,7 @@ async function crawlNaverShopping(query) {
     },
     signal: AbortSignal.timeout(7000),
   });
-  if (!response.ok) throw new Error(`Shopping crawl returned ${response.status}`);
+  if (!response.ok) throw new Error(`Product search crawl returned ${response.status}`);
 
   const html = await response.text();
   const $ = cheerio.load(html);
@@ -312,12 +312,12 @@ function createDemoAnalysis() {
       suggestedItems: [],
     },
     {
-      eventName: "미뤄 둔 생활 쇼핑",
+      eventName: "미뤄 둔 생활용품 구매",
       eventDateText: "날짜 미정",
       eventDate: null,
       eventDateConfidence: "low",
       mentionedItems: [
-        demoItem("남편 와이셔츠", "날짜 미정", null, "이번 주 안", null, "낮음", "계속 미뤘다고 직접 언급한 생활 쇼핑이에요.", "사이즈와 선호 색상 확인"),
+        demoItem("남편 와이셔츠", "날짜 미정", null, "이번 주 안", null, "낮음", "계속 미뤘다고 직접 언급한 생활용품 구매 과제예요.", "사이즈와 선호 색상 확인"),
       ],
       suggestedItems: [],
     },
